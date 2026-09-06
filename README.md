@@ -20,7 +20,7 @@ QoderRoute is an OpenAI-compatible and Anthropic-compatible proxy router for Qod
   Every account's plan tier, name, end date, and quota usage are fetched from `openapi.qoder.sh`. The background loop refreshes non-exhausted accounts every 5 minutes. Account cards display plan type, paid/free status, plan end date, and quota progress. When an account hits quota, it is parked (or deleted, if auto-delete is on). Parked accounts are not polled; refresh the card via **Accounts** (or `POST /api/accounts/{id}/quota/refresh`) to rejoin rotation once credits are back. Paid plan names are derived from the quota size, since the plan endpoint does not distinguish tiers: 2,000 credits → Pro Plan, 6,000 → Pro+ Plan, 20,000 → Ultra Plan (trials keep their API-reported name, e.g. Pro Trial with 300 credits).
 
 - **Free-Tier Rejection on Add**  
-  Adding an account validates the PAT over HTTP (job-token exchange + userinfo — no CLI required) and then checks the plan. The account name is optional: when omitted, the router fills it from the Qoder profile (`/api/v1/userinfo`). Accounts on the free tier (`personal_standard`, no paid plan) are rejected with a clear error instead of being parked as exhausted right away. Accounts with a plan but no remaining quota are still added and parked; they rejoin when you refresh them after credits return.
+  Adding an account validates the PAT over HTTP (job-token exchange + userinfo — no CLI required) and then checks the plan. The account name is optional: when omitted, the router fills it from the Qoder profile (`/api/v1/userinfo`). Accounts on the free tier (`personal_standard`, no paid plan) are rejected with a 400 instead of being parked as exhausted right away. Accounts with a plan but no remaining quota are added and parked; they rejoin when you refresh them after credits return. If **auto-delete exhausted** is on, that add is immediately swept and `POST /api/accounts` returns **409** (the row is gone).
 
 - **Rate-Limit vs Quota Distinction**  
   Transient 429 / rate-limit responses never park, delete, or cooldown an account — only genuine quota-exhaustion signals do (quota / credits-exhausted markers). Rate limits, upstream 5xx responses, connection failures and mid-stream drops are treated as infrastructure problems and left for the client to retry; they do not count toward an account's failure budget.
@@ -41,10 +41,10 @@ QoderRoute is an OpenAI-compatible and Anthropic-compatible proxy router for Qod
   When enabled, accounts marked as quota-exceeded are removed from the pool (including an immediate sweep of already-parked rows).
 
 - **OpenAI-Compatible API**  
-  The `/v1/chat/completions` endpoint accepts standard OpenAI request fields (messages, tools, tool_choice, reasoning_effort, context_window, max_tokens, etc.) and returns streaming SSE chunks matching the OpenAI response shape. `/v1/models` lists canonical model IDs, display names, credit factors, context windows, and Reasoning/Vision flags.
+  The `/v1/chat/completions` endpoint accepts standard OpenAI request fields (messages, tools, tool_choice, reasoning_effort, context_window, max_tokens, etc.) and returns streaming SSE chunks matching the OpenAI response shape. A failure after the stream has started is a structured `{error: {message, type, code}}` frame plus `[DONE]`, not a fake `finish_reason: "stop"`. Errors before the first chunk are ordinary HTTP errors. `/v1/models` lists canonical model IDs, display names, credit factors, context windows, and Reasoning/Vision flags (Thinking flags live on `/api/models/catalog`).
 
 - **Anthropic-Compatible API**  
-  The `/v1/messages` endpoint speaks the Anthropic Messages API natively — block-based content (text / thinking / tool_use / tool_result / image), `input_schema` tools, and named SSE events (`message_start`, `content_block_delta`, `message_delta`, ...) — so clients like Claude Code or any anthropic-sdk tool work without an adapter. Claude model-name hints map onto Qoder tiers (`opus` → Ultimate, `sonnet` → Performance, `haiku` → Efficient); context-window suffixes such as `[1m]` / `[200k]` are stripped. Usage (`input_tokens` / `output_tokens`) is reported in both streaming and non-streaming responses and counts toward the same Usage charts and account quotas as OpenAI traffic.
+  The `/v1/messages` endpoint speaks the Anthropic Messages API natively — block-based content (text / thinking / `redacted_thinking` / tool_use / tool_result / image), `input_schema` tools, `tool_choice` including `none`, and named SSE events (`message_start`, `content_block_delta`, `message_delta`, ...) — so clients like Claude Code or any anthropic-sdk tool work without an adapter. Images inside `tool_result` are forwarded as OpenAI `image_url` parts. Claude model-name hints map onto Qoder tiers (`opus` → Ultimate, `sonnet` → Performance, `haiku` → Efficient); context-window suffixes such as `[1m]` / `[200k]` are stripped. Usage (`input_tokens` / `output_tokens`) is reported in both streaming and non-streaming responses and counts toward the same Usage charts and account quotas as OpenAI traffic.
 
 ## Model Catalog
 
@@ -136,7 +136,7 @@ cd backend
 # start.bat         # Windows
 ```
 
-The server binds to `0.0.0.0:8010`. Use `./restart.sh` (or `restart.bat` on Windows) for a graceful restart that preserves the signer process. The scripts pick `backend/.venv` automatically when it exists (otherwise `python3` / `py -3`; set `PYTHON=/path/to/python` to override on Linux/macOS).
+`start.sh` / `restart.sh` / the `.bat` scripts always bind to `0.0.0.0:8010` (they ignore `HOST` / `PORT` from `.env`). Use `./restart.sh` (or `restart.bat` on Windows) for a graceful restart that preserves the signer process. The scripts pick `backend/.venv` automatically when it exists (otherwise `python3` / `py -3`; set `PYTHON=/path/to/python` to override on Linux/macOS).
 
 **Development (auto-reload):**
 
@@ -145,7 +145,7 @@ cd backend
 python3 run.py
 ```
 
-This starts uvicorn with hot-reload enabled when `DEBUG=true` in `.env`.
+This starts uvicorn with `HOST` / `PORT` from `.env` and hot-reload when `DEBUG=true`.
 
 **Frontend Development:**
 
@@ -178,20 +178,20 @@ Environment variables are loaded from `backend/.env` (pydantic-settings field ma
 | Variable                   | Default                              | Description                                             |
 |----------------------------|--------------------------------------|---------------------------------------------------------|
 | `DEBUG`                    | `False`                              | Enable debug mode / SQL echo                           |
-| `HOST`                     | `0.0.0.0`                            | Host to bind to                                         |
-| `PORT`                     | `8010`                               | HTTP port                                               |
+| `HOST`                     | `0.0.0.0`                            | Bind host for `python3 run.py` only (`start.sh` hardcodes `0.0.0.0`) |
+| `PORT`                     | `8010`                               | Bind port for `python3 run.py` only (`start.sh` hardcodes `8010`) |
 | `DATABASE_URL`             | `sqlite+aiosqlite:///./data/qoderroute.db` | Database URL                                          |
 | `JWT_SECRET`               | `qoderroute-super-secret-key...`     | Unused leftover                                         |
 | `JWT_ALGORITHM`            | `HS256`                              | Unused leftover                                         |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440`                             | Unused leftover                                         |
-| `QODERCLI_PATH`            | ``                                   | Legacy; not required — PAT validation runs over HTTP    |
-| `QODER_POLL_INTERVAL`      | `300`                                | Seconds between pool refreshes                          |
+| `QODERCLI_PATH`            | ``                                   | Unused leftover; PAT validation runs over HTTP          |
+| `QODER_POLL_INTERVAL`      | `300`                                | Caps how often availability/cooldown is recomputed. The quota HTTP loop is hardcoded at 300s. |
 | `ACCOUNT_COOLDOWN_SECONDS` | `30`                                 | Base backoff on consecutive failures                    |
 | `MAX_CONSECUTIVE_FAILURES` | `3`                                  | Max failures before cooldown                            |
 | `CORS_ORIGINS`             | `["http://localhost:5173", ...]`     | Allowed origins                                         |
-| `DATA_DIR`                 | `./data`                             | Data directory path                                     |
+| `DATA_DIR`                 | `./data`                             | Unused leftover                                         |
 | `QODER_WORKER_SCRIPT`      | ``                                   | Optional; enables extra API module not shipped in public build |
-| `QODER_INFER_BASE`         | (settings-based default)             | Optional env override for Qoder backend (api1/api2/api3)|
+| `QODER_INFER_BASE`         | (settings-based default)             | Optional env override: full URL (`https://api3.qoder.sh`), not `api3`. Wins over the DB `qoder_infer_base` setting. |
 
 Settings managed via `/api/settings` (stored in DB):
 
@@ -204,17 +204,17 @@ Settings managed via `/api/settings` (stored in DB):
 
 **OpenAI-Compatible Endpoints** (always public)
 
-- `POST /v1/chat/completions` — Chat completion (streaming SSE or JSON). Request schema follows `ChatCompletionRequest`. Accepts messages, tools, tool_choice, reasoning_effort, fast mode, context_window, max_tokens. Optional `x-session-id` / `x-session-affinity` headers are forwarded as the upstream session id.
-- `GET /v1/models` — List supported canonical model IDs with `display_name`, `credit_factor`, `context_length` / `context_windows`, and `is_reasoning` / `is_vision`. Also includes Anthropic-friendly `type` / `display_name` fields.
+- `POST /v1/chat/completions` — Chat completion (streaming SSE or JSON). Request schema follows `ChatCompletionRequest`. Accepts messages, tools, tool_choice, reasoning_effort, fast mode, context_window, max_tokens. Optional `x-session-id` / `x-session-affinity` headers are forwarded as the upstream session id. Mid-stream failures are structured `error` objects.
+- `GET /v1/models` — List supported canonical model IDs with `display_name`, `credit_factor`, `context_length` / `context_windows`, and `is_reasoning` / `is_vision`. Also includes Anthropic-friendly `type` / `display_name` fields. Thinking flags are on `/api/models/catalog`, not here.
 
 **Anthropic-Compatible Endpoints** (always public)
 
-- `POST /v1/messages` — Anthropic Messages API (streaming SSE or JSON). Handles block-based content, `input_schema` tools, `thinking` budgets, and reports usage as `input_tokens` / `output_tokens`.
+- `POST /v1/messages` — Anthropic Messages API (streaming SSE or JSON). Handles block-based content (including `redacted_thinking` and images in `tool_result`), `input_schema` tools, `tool_choice` (`none` included), `thinking` budgets, and reports usage as `input_tokens` / `output_tokens`.
 - `POST /v1/messages/count_tokens` — Rough token estimate for the upcoming request.
 
 **Admin REST API**
 
-- `GET POST /api/accounts` — List accounts or create a new account (PAT validation required). Includes filter views: `GET /api/accounts/available`, `GET /api/accounts/exhausted`.
+- `GET POST /api/accounts` — List accounts or create a new account (PAT validation required). Free-tier PATs return 400; exhausted + auto-delete returns 409. Filter views: `GET /api/accounts/available`, `GET /api/accounts/exhausted`.
 - `DELETE /api/accounts/{id}` — Delete account.
 - `POST /api/accounts/{id}/quota/refresh` — Refresh quota for one account (the way a parked account rejoins).
 - `GET /api/accounts/{id}/pat` — Reveal the full PAT for clipboard copy.

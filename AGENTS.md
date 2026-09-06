@@ -56,7 +56,7 @@ QoderRoute/
 │   │   ├── test_qoder_version.py
 │   │   ├── test_queue_parsing.py
 │   │   ├── test_quota_swap_and_counter.py
-│   │   ├── test_review_regressions.py # error scoping, partial quota refresh, duplicate park, thinking map
+│   │   ├── test_review_regressions.py # error scoping, atomic lease, structured stream errors, Anthropic round-trip
 │   │   ├── test_runtime_settings.py
 │   │   ├── test_signer_resilience.py
 │   │   └── test_thinking_regression.py
@@ -68,7 +68,7 @@ QoderRoute/
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── accounts/AccountManager.tsx     # Accounts tab with available/exhausted views
-│   │   │   ├── layout/AppLayout.tsx            # Sidebar nav + Routes (no Status/Auth)
+│   │   │   ├── layout/AppLayout.tsx            # Sidebar nav + Routes; PageRoutes syncs same-section search/hash onto displayLoc
 │   │   │   ├── layout/Dashboard.tsx            # Credits / pool / traffic / errors / quota
 │   │   │   ├── logs/Logs.tsx                   # Requests + Pool tabs, Timeline drawer, SSE
 │   │   │   ├── models/Models.tsx               # Catalog, canonical keys and credit multipliers
@@ -77,7 +77,8 @@ QoderRoute/
 │   │   │   └── worker/                         # [gitignored; not in public build] optional worker page
 │   │   ├── hooks/
 │   │   │   ├── useApi.ts                       # TanStack Query hooks (usePoolStatus, useDashboardStats, etc.)
-│   │   │   └── useCountUp.ts                   # Utility hook
+│   │   │   ├── useCountUp.ts                   # Utility hook
+│   │   │   └── usePageResume.ts                # Frozen-tab resize kick so Recharts/layout recover on visibilitychange
 │   │   ├── lib/
 │   │   │   ├── features.ts                     # Conditional imports for optional modules (WORKER_ENABLED, WorkerPage lazy loader)
 │   │   │   └── utils.ts                        # Formatting utilities (timeAgo, parseUtc, cn helpers)
@@ -163,7 +164,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
 
 - **Frontend Organization:** Components are organized by feature folder (`components/accounts`, `components/settings`, etc.). State is managed by TanStack Query with hooks in `hooks/useApi.ts`. Types live in `types/index.ts`.
   - **Dashboard** ([`Dashboard.tsx`](frontend/src/components/layout/Dashboard.tsx)): credits left, pool `available / total` (+ cooldown/exhausted subline), last-hour window, traffic chart (stock recharts Tooltip), recent errors, quota-by-account with `plan_name` chips. No donut, no `accounts_by_model`, no custom 200-line hover layer.
-  - **Logs** ([`Logs.tsx`](frontend/src/components/logs/Logs.tsx)): toggle **Requests | Pool**. Requests = table + Timeline drawer; Pool = lifecycle table (`action` + detail). `?account=` filters by id **or** matching `account_name` (delete/re-add keeps the name, gets a new id). Pause/Clear/`DELETE /api/logs` shared.
+  - **Logs** ([`Logs.tsx`](frontend/src/components/logs/Logs.tsx)): toggle **Requests | Pool**. Requests = table + Timeline drawer; Pool = lifecycle table (`action` + detail). `?account=` filters by id **or** matching `account_name` (delete/re-add keeps the name, gets a new id). Pause/Clear/`DELETE /api/logs` shared. Same-section `location.search` (Timeline `?request=`, Pool toggle) must copy onto `PageRoutes`'s `displayLoc` or `useSearchParams` stays stale. Initial Logs query uses `refetchOnWindowFocus: false`.
 
 - **Settings Registry:** `settings_service.py` defines `_DEFAULTS` dict at module scope. Every new runtime setting requires three updates:
   1. Add key with default value to `_DEFAULTS`.
@@ -171,7 +172,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   3. Add the property to `AppSettings` type in `frontend/src/types/index.ts`.
   If a setting is list-valued, JSON-serialize it in the key/value table and return a detached list copy from `snapshot()`. Turning `accounts_auto_delete_exhausted` on immediately sweeps currently parked accounts.
 
-- **JWT env leftovers:** `jwt_secret`, `jwt_algorithm`, and `access_token_expire_minutes` in `config.py` are unused — do not wire them.
+- **JWT / unused env leftovers:** `jwt_secret`, `jwt_algorithm`, and `access_token_expire_minutes` in `config.py` are unused — do not wire them. `data_dir` is also unused (paths are hardcoded / relative). `qodercli_path` / `_find_qodercli()` are leftovers; PAT validation is HTTP-only. `HOST`/`PORT` apply only to `run.py`; `start.sh` / `restart.sh` / `.bat` hardcode `0.0.0.0:8010`. `qoder_poll_interval` paces `_refresh_if_stale` (availability/cooldown), not the quota HTTP loop (`QUOTA_REFRESH_INTERVAL = 300` in `main.py`). `QODER_INFER_BASE` env must be a full URL (`https://api3.qoder.sh`), not `api1`/`api2`/`api3`.
 
 - **Retired panel auth / probes:** Panel API keys, AuthGate, Status page, and model-health probes were removed. `init_db` drops the `api_keys` table and deletes `auth_enabled`, `probe_interval_minutes`, and `probe_model_keys` from settings. Do not reintroduce those keys without restoring the full stacks. JWT fields in `config.py` stay unused.
 
@@ -228,7 +229,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   `pool.add_account` rejects a duplicate token (`ValueError`: `"This PAT is already in the pool"`) and `init_db` creates `ix_accounts_pat_token`. Do not add a second row for the same PAT.
 
 - **Per-Account `machine_id` Is Required**  
-  Each account has its own UUID `machine_id` (generated on add, backfilled at startup for legacy rows). `run_infer` errors if it is missing. Probes reuse the selected account's `machine_id` so Qoder does not see a second device. There is no shared/fallback machine id.
+  Each account has its own UUID `machine_id` (generated on add, backfilled at startup for legacy rows). `run_infer` errors if it is missing. There is no shared/fallback machine id.
 
 - **Session Affinity Headers**  
   OpenCode may send `x-session-id` or `x-session-affinity`. `direct_client.normalize_session_id` validates before the value enters the signed body; invalid/missing ids get a generated UUID. Log only the SHA-256 fingerprint, never the raw id.
@@ -297,7 +298,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
 
 5. **Stream from Qoder:** Backend streams POST to the returned URL. SSE lines are buffered and decoded (with decryption via signer `/decrypt` when necessary). Events emitted: `text`, `thinking`, `reasoning_item`, `reasoning_signature`, `tool_calls`, `function_call`, `done`, `error`.
 
-6. **Map to OpenAI Chunks:** In streaming mode, each SSE chunk from Qoder is wrapped into OpenAI-style `chat.completion.chunk` format and yielded via `StreamingResponse`. Final chunk includes usage metrics and finish_reason.
+6. **Map to OpenAI Chunks:** In streaming mode, each SSE chunk from Qoder is wrapped into OpenAI-style `chat.completion.chunk` format and yielded via `StreamingResponse`. Final chunk includes usage metrics and finish_reason. A mid-stream `error` event is a structured `{error: {message, type, code}}` frame plus `[DONE]`, not a completion with `finish_reason: "stop"`. Anthropic mid-stream uses named `event: error`.
 
 7. **Bookkeeping:** On `done`:
    - `pool.mark_success(account_id, tokens_used, credits_used)` updates counters and local quota estimates.
@@ -305,10 +306,11 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
    - Usage stats read those completions (`phase=done`/`outcome=ok`), not freeform message text.
 
 8. **Failure Handling:** Errors classified by source (infrastructure, quota, model_queue, account):
-   - Infrastructure (signer, 429/rate-limit, 416 session blocked, truncated stream): raise HTTPException; do not penalize the account.
-   - Quota: `pool.mark_quota_exceeded()` and swap to next account (retry up to MAX_SWAP_ATTEMPTS=3).
+   - First event (before any SSE frame): HTTPException. Mid-stream OpenAI: structured error chunk (see above); Anthropic: `event: error`. Do not penalize the account for infrastructure.
+   - Infrastructure (signer, 429/rate-limit, 416 session blocked, truncated stream): no `mark_failure`.
+   - Quota: `pool.mark_quota_exceeded()` and swap to next account (retry up to MAX_SWAP_ATTEMPTS=3) — swap only works before the stream has started.
    - Model queue (10605): retry once after delay if `isQueued=false`; otherwise fail without `mark_failure`.
-   - Account error: `pool.mark_failure()` with exponential cooldown backoff; raise HTTPException.
+   - Account error: `pool.mark_failure()` with exponential cooldown backoff.
 
 9. **Completion Response:** Streaming mode yields SSE; non-streaming mode aggregates text/thinking/tool calls/function call/signature and returns `ChatCompletionResponse`.
 
@@ -327,5 +329,6 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   - `test_runtime_settings.py`: Validates SettingsUpdate schema constraints for known keys.
   - `test_model_catalog.py`: Verifies catalog metadata, canonical routing identities, and API output.
   - `test_thinking_regression.py`: Verifies correct model config (context length, reasoning enums) for specific model levels.
+  - `test_review_regressions.py`: Error scoping, atomic pick+lease, SSE `aclose`/`end_request`, structured OpenAI stream errors, Anthropic `tool_choice: none` / tool_result images / `redacted_thinking`.
 
 When writing new tests, follow existing patterns: define fake sessions/repositories for isolation, mock network calls, and assert both side-effects (session state changes) and return values.
