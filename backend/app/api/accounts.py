@@ -260,13 +260,15 @@ async def create_account(body: AccountCreate, db: AsyncSession = Depends(get_db)
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    await pool.refresh_quota(account.id)
+    # Capture the PK before refresh_quota/refresh: a failed refresh expires
+    # the instance, and reading account.id then lazy-loads (MissingGreenlet).
+    account_id = account.id
+    await pool.refresh_quota(account_id)
     try:
         await db.refresh(account)
         return AccountOut.model_validate(account)
     except Exception:  # noqa: BLE001 — auto-delete expires the instance
         pass
-    account_id = account.id
     try:
         db.expunge(account)
     except Exception:  # noqa: BLE001
