@@ -261,13 +261,23 @@ async def create_account(body: AccountCreate, db: AsyncSession = Depends(get_db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     await pool.refresh_quota(account.id)
-    # refresh_quota wrote through its own session; ``db`` still holds the
-    # pre-quota row in its identity map, so re-read it before responding.
     try:
         await db.refresh(account)
-    except Exception:  # noqa: BLE001 — auto-delete may have removed it already
+        return AccountOut.model_validate(account)
+    except Exception:  # noqa: BLE001 — auto-delete expires the instance
         pass
-    return AccountOut.model_validate(account)
+    account_id = account.id
+    try:
+        db.expunge(account)
+    except Exception:  # noqa: BLE001
+        pass
+    fresh = await db.get(Account, account_id)
+    if fresh is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Account is exhausted and was removed (auto-delete exhausted is on).",
+        )
+    return AccountOut.model_validate(fresh)
 
 
 # ── Item routes LAST ──

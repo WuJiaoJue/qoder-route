@@ -106,19 +106,40 @@ def _system_text(system: object) -> str:
     return ""
 
 
-def _tool_result_content(block: dict) -> str:
+def _redacted_thinking_block(item: dict) -> Optional[dict]:
+    """Map Qoder reasoning_item.encrypted_content onto Anthropic redacted_thinking."""
+    if not isinstance(item, dict):
+        return None
+    encrypted = item.get("encrypted_content") or item.get("data")
+    if not encrypted:
+        return None
+    return {"type": "redacted_thinking", "data": str(encrypted)}
+
+
+def _tool_result_content(block: dict):
     content = block.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
+        text_parts: list[str] = []
+        image_parts: list[dict] = []
         for sub in content:
-            if isinstance(sub, dict):
-                if sub.get("type") == "text":
-                    parts.append(sub.get("text", ""))
-                elif sub.get("type") == "image":
-                    parts.append("[image omitted]")
-        return "\n".join(p for p in parts if p)
+            if not isinstance(sub, dict):
+                continue
+            if sub.get("type") == "text":
+                text_parts.append(sub.get("text", ""))
+            elif sub.get("type") == "image":
+                converted = _image_block_to_openai(sub)
+                if converted:
+                    image_parts.append(converted)
+        if image_parts:
+            parts: list[dict] = []
+            text = "\n".join(p for p in text_parts if p)
+            if text:
+                parts.append({"type": "text", "text": text})
+            parts.extend(image_parts)
+            return parts
+        return "\n".join(p for p in text_parts if p)
     if content is None:
         return ""
     return json.dumps(content, ensure_ascii=False)
@@ -282,6 +303,8 @@ def _convert_tool_choice(tool_choice: Optional[dict]) -> Optional[object]:
         return "auto"
     if choice_type == "any":
         return "required"
+    if choice_type == "none":
+        return "none"
     if choice_type == "tool":
         return {
             "type": "function",
@@ -355,8 +378,6 @@ async def create_message(
         account_id = account.id
         pat_token = account.pat_token
         machine_id = account.machine_id
-        if not await pool.begin_request(account_id):
-            continue
         leased = True
         trace.set_account(account)
         label = getattr(account, "name", None) or f"#{account.id}"
@@ -428,6 +449,7 @@ async def create_message(
                 final_text = ""
                 final_thinking = ""
                 final_reasoning_signature = ""
+                final_reasoning_item: dict | None = None
                 final_tool_call_fragments: dict[int, dict] = {}
                 final_function_call: dict = {}
                 final_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -445,6 +467,10 @@ async def create_message(
                         final_thinking += event["thinking"]
                     elif event["type"] == "reasoning_signature":
                         final_reasoning_signature += event["signature"]
+                    elif event["type"] == "reasoning_item":
+                        item = event.get("reasoning_item")
+                        if isinstance(item, dict):
+                            final_reasoning_item = item
                     elif event["type"] == "tool_calls":
                         _merge_tool_call_fragments(final_tool_call_fragments, event["tool_calls"])
                     elif event["type"] == "function_call":
@@ -510,6 +536,9 @@ async def create_message(
                 if final_reasoning_signature:
                     thinking_block["signature"] = final_reasoning_signature
                 content_blocks.append(thinking_block)
+            redacted = _redacted_thinking_block(final_reasoning_item or {})
+            if redacted:
+                content_blocks.append(redacted)
             content_blocks.append({"type": "text", "text": final_text})
             for call in final_tool_calls:
                 try:
@@ -606,21 +635,6 @@ def _anthropic_sse_response(
             yield e
 
     async def event_stream():
-        # --- message_start -------------------------------------------------
-        yield _sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 1, "output_tokens": 0},
-            },
-        })
-
         next_index = 0
         open_block_type: str | None = None
         open_block_index = -1
@@ -655,6 +669,21 @@ def _anthropic_sse_response(
 
         errored = False
         try:
+            # message_start must live inside try/finally so a client abort
+            # after the first frame still releases the account lease.
+            yield _sse_event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            })
             async for event in _chain():
                 etype = event["type"]
                 if etype == "text":
@@ -698,6 +727,17 @@ def _anthropic_sse_response(
                         "index": open_block_index,
                         "delta": {"type": "signature_delta", "signature": event["signature"]},
                     })
+                elif etype == "reasoning_item":
+                    block = _redacted_thinking_block(event.get("reasoning_item") or {})
+                    if not block:
+                        continue
+                    closed = close_block()
+                    if closed:
+                        yield closed
+                    yield open_block("redacted_thinking", block)
+                    closed = close_block()
+                    if closed:
+                        yield closed
                 elif etype == "tool_calls":
                     _merge_tool_call_fragments(tool_fragments, event["tool_calls"])
                 elif etype == "function_call":
@@ -770,7 +810,12 @@ def _anthropic_sse_response(
                 "error": {"type": "api_error", "message": str(e)},
             })
         finally:
-            await pool.end_request(account_id)
+            if account_id is not None:
+                await pool.end_request(account_id)
+            try:
+                await gen.aclose()
+            except Exception:  # noqa: BLE001
+                pass
 
         # flush accumulated tool calls as tool_use blocks
         for call in _finalize_tool_calls(tool_fragments):

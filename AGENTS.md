@@ -209,7 +209,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   The background quota loop (`_quota_refresher`) only refreshes non-exhausted accounts (`is_quota_exceeded == False`). Exhausted accounts remain untouched until manually refreshed via `/api/accounts/{id}/quota/refresh` — which, when credits are back, also restores `is_available`, clears cooldown/failures, and rejoins routing immediately. With `accounts_auto_delete_exhausted` enabled, parking is replaced by deletion.
 
 - **Partial Quota Fetches Carry No Verdict**  
-  `quota_service.fetch_plan_quota` returns a dict as soon as any of `/user/plan`, `/quota/usage`, `/userinfo` answers and flags which did via `plan_fetched` / `quota_fetched`. `refresh_quota` only parks or un-parks when `quota_fetched` is true; otherwise it just stores the plan/email metadata and leaves `is_available` / cooldown / failures untouched (a missing `is_quota_exceeded` key is *not* "credits are back"). `create_account` refuses a PAT when `plan_fetched` is false because the free-tier check needs the tier. Mocks that omit the flags are treated as complete fetches.
+  `quota_service.fetch_plan_quota` returns a dict as soon as any of `/user/plan`, `/quota/usage`, `/userinfo` answers and flags which did via `plan_fetched` / `quota_fetched`. `refresh_quota` only parks or un-parks when `quota_fetched` is true; otherwise it just stores the plan/email metadata and leaves `is_available` / cooldown / failures untouched (a missing `is_quota_exceeded` key is *not* "credits are back"). When the verdict *is* exhausted, plan/quota fields are written **before** `_park_exhausted` so parked rows keep `plan_name` / `quota_total` / `quota_used`. `create_account` refuses a PAT when `plan_fetched` is false because the free-tier check needs the tier. If auto-delete then removes the new row, `POST /api/accounts` returns **409**, not a 500 on the deleted ORM object. Mocks that omit the flags are treated as complete fetches.
 
 - **Concurrent Delete vs In-Flight Request**  
   `mark_success` / `mark_failure` catch `StaleDataError`: an account deleted (manual or auto-sweep) while its request was streaming must not turn a successful completion into a 500. Keep these handlers in place when editing bookkeeping code. Lifetime `PoolCounter` credits use an atomic SQLite upsert for the same reason (parallel fill-first completions). The local quota drain also `RETURNING`s `is_quota_exceeded`, so a completion that lands after a parallel one already parked the account does not park (or, with auto-delete, `DELETE`) it a second time.
@@ -240,7 +240,10 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   `_reasoning_effort_from_thinking`: absent → `None` (model peak via `_normalize_effort`), `{"type":"disabled"}` → `"none"` (thinking really off), `enabled` without budget → `None`, budgets map `<4k` low / `<10k` medium / `<32k` high / `>=32k` max. An explicit disable must never come out as `max`, and a large budget must not be weaker than omitting `thinking`.
 
 - **`tool_choice` Is Honored on Both Routes**  
-  OpenAI `ChatCompletionRequest.tool_choice` and Anthropic `tool_choice` (converted to the OpenAI shape) are passed into `run_infer` and into the native body. Do not drop the field.
+  OpenAI `ChatCompletionRequest.tool_choice` and Anthropic `tool_choice` (converted to the OpenAI shape) are passed into `run_infer` and into the native body. Anthropic `{"type":"none"}` maps to `"none"` — do not drop it. Images inside Anthropic `tool_result` become OpenAI `image_url` parts, not `[image omitted]`. Anthropic SSE/non-stream maps `reasoning_item.encrypted_content` to a `redacted_thinking` block so clients can round-trip continuation state.
+
+- **OpenAI Mid-Stream Errors Are Structured**  
+  A failure after the SSE has started is an `error` object (`message` / `type` / `code`), not assistant content `[error] …` with `finish_reason: "stop"`. `[DONE]` still closes the stream. The first SSE frame (OpenAI role chunk / Anthropic `message_start`) lives inside the `try/finally` that calls `end_request`, so a client abort after that frame cannot leak the in-flight lease.
 
 - **Model Keys vs Display Names**  
   The public endpoint `/v1/models` returns model objects with `id` set to canonical catalog keys (for example `qmodel_38max`, `cmodel`, `ultimate`). Clients should pass these exact strings. Friendly names such as `"Qwen3.8-Max"` are normalized by `resolve_model_level()`, but canonical IDs are preferred. `qmodel_preview` is a private compatibility key and must not be advertised as Qwen3.8-Max. `/v1/models` also sets Anthropic-friendly `type` + `display_name`; Thinking flags live on `/api/models/catalog`, not on `/v1/models`.
@@ -261,7 +264,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   Accounts cannot be toggled inactive. Startup backfill forces `is_active = 1` for any legacy disabled rows; the column remains only so existing pool filters keep working.
 
 - **Near-Exhaustion Spill Under Concurrency**  
-  Fill-first still sticks to one PAT while healthy. When `quota_remaining <= 15` and that account already has an in-flight request, additional starts spill to the next available account. `begin_request` re-checks DB routability before upstream work; SSE reading stops on the first upstream error so hung post-quota connections do not burn the 300s timeout.
+  Fill-first still sticks to one PAT while healthy. When `quota_remaining <= 15` and that account already has an in-flight request, additional starts spill to the next available account. `get_next_account` picks **and leases** under `_in_flight_lock` (DB routability re-check included); callers must `end_request` or hand the lease to the SSE generator. Do not snapshot inflight, return, then increment later — two parallel starts would both stick to the dying PAT. SSE reading stops on the first upstream error so hung post-quota connections do not burn the 300s timeout.
 
 - **Cosy/CLI Version Auto-Refresh**  
   Do not hardcode `Cosy-Version` / `business.version` / `qoder/<ver>` User-Agent. `qoder_version.py` fetches `@qoder-ai/qodercli` latest from npm on startup and every 6 hours, then feeds `quota_service`, `direct_client`, and the signer `/infer` payload (`cosy_version`). Fallback stays in memory if npm is unreachable (built-in fallback is the `_FALLBACK_VERSION` constant). `/api/health` exposes `qoder_cli_version` + source.
@@ -284,7 +287,7 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
 
 2. **Resolve Model:** `resolve_model_level(request.model)` normalizes input against `model_catalog.py` to a canonical level key (e.g., `"qmodel_38max"`).
 
-3. **Select Account:** `pool.get_next_account(db, exclude_ids=set())` selects the first `is_active && is_available && !is_quota_exceeded && cooldown_ok` account ordered by priority desc, id asc. `begin_request` re-checks DB routability and leases the in-flight slot.
+3. **Select Account:** `pool.get_next_account(db, exclude_ids=set())` selects the first `is_active && is_available && !is_quota_exceeded && cooldown_ok` account ordered by priority desc, id asc, re-checks DB routability, and leases the in-flight slot atomically. The SSE `finally` (or the non-stream `finally`) calls `end_request`.
 
 4. **Prepare Upstream Request:** `direct_client.run_infer(pat, model_level, messages, ..., machine_id=account.machine_id)` performs:
    - Job token exchange via `quota_service.get_job_token(pat)` (cached).

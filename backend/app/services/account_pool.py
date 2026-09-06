@@ -53,10 +53,11 @@ class AccountPool:
         self._in_flight: dict[int, int] = {}
 
     async def begin_request(self, account_id: int) -> bool:
-        """Claim an account for one in-flight request.
+        """Claim a specific account for one in-flight request.
 
-        Re-checks DB routability so a concurrent park between selection and
-        upstream start cannot send the client to a dead PAT.
+        Routing should use ``get_next_account``, which picks and leases
+        atomically. This keeps a DB routability check for callers that
+        already know the id.
         """
         async with async_session() as session:
             acc = await session.get(Account, account_id)
@@ -118,6 +119,9 @@ class AccountPool:
         Near exhaustion, only one in-flight request may stay on the dying
         account; additional concurrent starts spill to the next PAT so a
         burst does not all fail together.
+
+        The returned account is already leased (``_in_flight`` incremented).
+        The caller must ``end_request`` or hand the lease to the SSE generator.
         """
         await self._refresh_if_stale()
 
@@ -146,19 +150,25 @@ class AccountPool:
         if not available:
             return None
 
+        # Pick + lease under the same lock so two concurrent starts cannot
+        # both stick to a near-empty PAT while a healthy spare sits idle.
+        # Caller must ``end_request`` (or transfer the lease to the SSE).
         async with self._in_flight_lock:
-            inflight = dict(self._in_flight)
-
-        for idx, acc in enumerate(available):
-            remaining = acc.quota_remaining
-            near_empty = (
-                isinstance(remaining, (int, float))
-                and remaining <= _NEAR_EMPTY_CREDITS
-            )
-            if near_empty and inflight.get(acc.id, 0) > 0 and idx + 1 < len(available):
-                continue
-            return acc
-        return available[0]
+            for idx, acc in enumerate(available):
+                remaining = acc.quota_remaining
+                near_empty = (
+                    isinstance(remaining, (int, float))
+                    and remaining <= _NEAR_EMPTY_CREDITS
+                )
+                has_fallback = idx + 1 < len(available)
+                if near_empty and self._in_flight.get(acc.id, 0) > 0 and has_fallback:
+                    continue
+                fresh = await session.get(Account, acc.id)
+                if not fresh or not _row_is_routable(fresh):
+                    continue
+                self._in_flight[fresh.id] = self._in_flight.get(fresh.id, 0) + 1
+                return fresh
+            return None
 
     async def refresh_quota(self, account_id: int) -> Optional[dict]:
         """Fetch live plan+quota from Qoder and persist on the account row."""
@@ -175,10 +185,6 @@ class AccountPool:
             # plan/userinfo calls succeeded there is no quota verdict, so update
             # the metadata and leave availability exactly as it was.
             quota_fetched = bool(data.get("quota_fetched", True))
-
-            if quota_fetched and data.get("is_quota_exceeded"):
-                await self._park_exhausted(session, acc, "quota refresh shows exhausted")
-                return data
 
             was_parked = bool(acc.is_quota_exceeded)
             was_cooling = acc.cooldown_until is not None
@@ -202,6 +208,10 @@ class AccountPool:
             for src, dst in mapping.items():
                 if src in data and data[src] is not None:
                     setattr(acc, dst, data[src])
+
+            if quota_fetched and data.get("is_quota_exceeded"):
+                await self._park_exhausted(session, acc, "quota refresh shows exhausted")
+                return data
 
             if not quota_fetched:
                 await session.commit()

@@ -76,6 +76,24 @@ def _openai_chunk(chunk_id: str, model: str, created: int, delta: dict, finish_r
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _openai_error_chunk(message: str, error_kind: str) -> str:
+    """Structured OpenAI error frame — not a fake completion with finish_reason stop."""
+    error_type = {
+        "quota": "insufficient_quota",
+        "model_queue": "server_error",
+        "infrastructure": "server_error",
+        "account": "api_error",
+    }.get(error_kind, "server_error")
+    payload = {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": error_kind,
+        }
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 def _resolve_level(requested: str) -> str:
     """Model comes from the request, not the account. Every account can serve
     every model in the Qoder pool."""
@@ -157,10 +175,6 @@ async def chat_completions(
         account_id = account.id
         pat_token = account.pat_token
         machine_id = account.machine_id
-        # Re-check + lease so concurrent park between select and upstream
-        # start cannot send the client to a dying PAT.
-        if not await pool.begin_request(account_id):
-            continue
         leased = True
         trace.set_account(account)
         label = getattr(account, "name", None) or f"#{account.id}"
@@ -415,8 +429,6 @@ def _sse_response(
             yield e
 
     async def event_stream():
-        yield _openai_chunk(chunk_id, model, created, {"role": "assistant", "content": ""})
-
         errored = False
         saw_done = False
         saw_tool_calls = False
@@ -424,6 +436,7 @@ def _sse_response(
         thinking_chars = 0
         text_chars = 0
         try:
+            yield _openai_chunk(chunk_id, model, created, {"role": "assistant", "content": ""})
             async for event in _chain():
                 if event["type"] == "text":
                     trace.mark_first_token()
@@ -510,18 +523,25 @@ def _sse_response(
                             # flaky network / upstream backpressure — not the
                             # account's fault, don't burn its failure budget
                             trace.emit("warn", f"transient stream error (no account penalty): {msg[:200]}", phase="error", outcome=log_outcome("infrastructure", msg))
+                            error_kind = "infrastructure"
                         else:
                             trace.emit("error", f"stream error: {msg[:200]}", phase="error", outcome="account")
                             await pool.mark_failure(account_id, msg)
-                    yield _openai_chunk(chunk_id, model, created, {"content": f"[error] {event['message']}"}, "stop")
+                    yield _openai_error_chunk(msg, error_kind)
+                    break
         except Exception as e:
             errored = True
             trace.emit("error", f"stream exception: {str(e)[:200]}", phase="error", outcome="infra")
             # Exceptions in router/SSE processing are local infrastructure
             # failures. Explicit upstream account errors arrive as events.
-            yield _openai_chunk(chunk_id, model, created, {"content": f"[error] {e}"}, "stop")
+            yield _openai_error_chunk(str(e), "infrastructure")
         finally:
-            await pool.end_request(account_id)
+            if account_id is not None:
+                await pool.end_request(account_id)
+            try:
+                await gen.aclose()
+            except Exception:  # noqa: BLE001
+                pass
 
         if not errored and not saw_done:
             yield _openai_chunk(chunk_id, model, created, {}, "stop")
