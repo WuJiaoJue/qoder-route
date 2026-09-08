@@ -2,6 +2,18 @@
 
 This document provides structural, operational, and conventions guidance for agents interacting with or modifying QoderRoute. All information must match the actual codebase in this repository.
 
+## Localhost-only — not a hosted product
+
+QoderRoute is a **personal, local operator tool**. It is not designed, documented, or reviewed as multi-tenant production SaaS.
+
+- The public GitHub repo is the intended distribution. Shipping the source on GitHub does **not** mean "harden this for the public internet."
+- Panel API keys, AuthGate, and JWT were removed on purpose. `/api/*`, `/v1/*`, and `GET /api/accounts/{id}/pat` are unauthenticated by design. Do **not** reintroduce auth, API keys, or JWT "because it binds `0.0.0.0`" unless the operator explicitly asks.
+- `start.sh` / `restart.sh` / the `.bat` scripts bind `0.0.0.0:8010` so the box can reach the panel on LAN. That is a local convenience, not a production listen policy. The signer stays on `127.0.0.1:8123`.
+- PATs live plaintext in SQLite (`data/qoderroute.db`, gitignored). Treat the machine as the trust boundary: do not flag missing encryption-at-rest or missing panel login as product bugs.
+- Reviews and PRs should assume a single operator on a private host. Internet-facing hardening (TLS termination, authn/authz, PAT vaults, CORS for arbitrary origins) is out of scope unless requested.
+
+"Production" in this repo (`./start.sh`, no uvicorn reload, serving `frontend/dist`) means **local prod mode on the operator's machine**, not "deploy this to a VPS for strangers."
+
 ## Project Structure Map
 
 ```
@@ -172,9 +184,9 @@ The regression suite is local and gitignored. Run it only when `backend/tests/` 
   3. Add the property to `AppSettings` type in `frontend/src/types/index.ts`.
   If a setting is list-valued, JSON-serialize it in the key/value table and return a detached list copy from `snapshot()`. Turning `accounts_auto_delete_exhausted` on immediately sweeps currently parked accounts.
 
-- **JWT / unused env leftovers:** `jwt_secret`, `jwt_algorithm`, and `access_token_expire_minutes` in `config.py` are unused — do not wire them. `data_dir` is also unused (paths are hardcoded / relative). `qodercli_path` / `_find_qodercli()` are leftovers; PAT validation is HTTP-only. `HOST`/`PORT` apply only to `run.py`; `start.sh` / `restart.sh` / `.bat` hardcode `0.0.0.0:8010`. `qoder_poll_interval` paces `_refresh_if_stale` (availability/cooldown), not the quota HTTP loop (`QUOTA_REFRESH_INTERVAL = 300` in `main.py`). `QODER_INFER_BASE` env must be a full URL (`https://api3.qoder.sh`), not `api1`/`api2`/`api3`.
+- **JWT / unused env leftovers:** `jwt_secret`, `jwt_algorithm`, and `access_token_expire_minutes` in `config.py` are unused — do not wire them (see **Localhost-only** above). `data_dir` is also unused (paths are hardcoded / relative). `qodercli_path` / `_find_qodercli()` are leftovers; PAT validation is HTTP-only. `HOST`/`PORT` apply only to `run.py`; `start.sh` / `restart.sh` / `.bat` hardcode `0.0.0.0:8010`. `qoder_poll_interval` paces `_refresh_if_stale` (availability/cooldown), not the quota HTTP loop (`QUOTA_REFRESH_INTERVAL = 300` in `main.py`). `QODER_INFER_BASE` env must be a full URL (`https://api3.qoder.sh`), not `api1`/`api2`/`api3`.
 
-- **Retired panel auth / probes:** Panel API keys, AuthGate, Status page, and model-health probes were removed. `init_db` drops the `api_keys` table and deletes `auth_enabled`, `probe_interval_minutes`, and `probe_model_keys` from settings. Do not reintroduce those keys without restoring the full stacks. JWT fields in `config.py` stay unused.
+- **Retired panel auth / probes:** Panel API keys, AuthGate, Status page, and model-health probes were removed **on purpose** — this is a localhost operator panel, not a hosted control plane. `init_db` drops the `api_keys` table and deletes `auth_enabled`, `probe_interval_minutes`, and `probe_model_keys` from settings. Do not reintroduce those keys, JWT, or a login gate unless the operator asks. `GET /api/accounts/{id}/pat` returning the full token is intentional for the local clipboard.
 
 - **DashboardStats shape:** `GET /api/accounts/stats/dashboard` exposes `accounts_exhausted` (parked quota-exceeded rows). There is **no** `accounts_by_model` — `Account.model_level` is always `'auto'` from the add form and is not a routing dimension. Do not revive per-account model KPIs.
 
