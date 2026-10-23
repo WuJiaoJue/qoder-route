@@ -16,6 +16,7 @@ const ROUTING_STRATEGIES: { value: RoutingStrategy; label: string }[] = [
   { value: 'fill_first', label: 'Fill first — stick to one account' },
   { value: 'spread', label: 'Spread — fewest in-flight requests' },
   { value: 'least_used', label: 'Least used — fewest lifetime requests' },
+  { value: 'by_conversation', label: 'By conversation — shard accounts per conversation' },
 ]
 
 type SelectOption<T extends string | number> = { value: T; label: string }
@@ -187,6 +188,15 @@ export function Settings() {
               Accounts. A paid account stops taking paid-model traffic once its remaining credit reaches its own reserve, so the
               tail of that plan is never drained. Free models and free-tier accounts are never gated.
             </span>
+
+            <div className="mt-5 pt-5" style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+              <SettingRow
+                title="Conversation affinity"
+                hint="Keep successive turns of one conversation on the same account, so upstream prefix caching stays warm. A preference only: an unavailable or failing account still falls through to the strategy above."
+                checked={data?.conversation_affinity ?? true}
+                onChange={(v) => set({ conversation_affinity: v })}
+              />
+            </div>
           </div>
         )}
       </Card>

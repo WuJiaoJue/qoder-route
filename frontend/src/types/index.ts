@@ -95,7 +95,7 @@ export interface WorkerStatus {
 }
 
 export type QoderInferBase = 'api1' | 'api2' | 'api3'
-export type RoutingStrategy = 'fill_first' | 'spread' | 'least_used'
+export type RoutingStrategy = 'fill_first' | 'spread' | 'least_used' | 'by_conversation'
 
 export interface AppSettings {
   worker_logs_enabled: boolean
@@ -107,6 +107,7 @@ export interface AppSettings {
   accounts_auto_delete_exhausted: boolean
   qoder_infer_base: QoderInferBase
   routing_strategy: RoutingStrategy
+  conversation_affinity: boolean
 }
 
 export interface ActivityPoint {

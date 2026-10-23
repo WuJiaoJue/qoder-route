@@ -15,6 +15,7 @@ from app.services import direct_client
 from app.services.request_log import RequestTrace, log_outcome
 from app.services.qoder_client import resolve_model_level
 from app.services.model_catalog import is_free_model
+from app.services.conversation_affinity import derive_conversation_key
 from app.services.quota_service import (
     looks_like_quota_error,
     looks_like_model_queue,
@@ -207,6 +208,9 @@ async def chat_completions(
 ):
     messages_dicts = [m.model_dump() for m in body.messages]
     session_id = _client_session_id(request.headers)
+    # Account stickiness key: an explicit client session wins, otherwise a hash
+    # of the conversation prefix. See conversation_affinity for the caveat.
+    conversation_key = derive_conversation_key(session_id, messages_dicts)
     tried_ids: set[int] = set()
     model_level = _resolve_level(body.model)
     trace = RequestTrace("openai", model_level)
@@ -217,6 +221,7 @@ async def chat_completions(
             db,
             exclude_ids=tried_ids,
             free_model=free_model,
+            conversation_key=conversation_key,
         )
         if not account:
             break

@@ -24,7 +24,12 @@ _QODER_INFER_BASES = frozenset({"api1", "api2", "api3"})
 #   spread     — fewest in-flight requests first, then most remaining credit.
 #                Useful for bursts / parallel agents: no single PAT gets stacked.
 #   least_used — fewest lifetime requests first, then lowest id. Evens out wear.
-ROUTING_STRATEGIES = frozenset({"fill_first", "spread", "least_used"})
+#   by_conversation — deterministic shard: one conversation always starts on the
+#                same account, different conversations land on different
+#                accounts. Distributes concurrency across the pool without
+#                breaking conversation locality; degrades to fill_first when the
+#                client sends no session identifier.
+ROUTING_STRATEGIES = frozenset({"fill_first", "spread", "least_used", "by_conversation"})
 
 _DEFAULTS: dict[str, SettingValue] = {
     "worker_logs_enabled": True,
@@ -36,6 +41,10 @@ _DEFAULTS: dict[str, SettingValue] = {
     "accounts_auto_delete_exhausted": False,
     "qoder_infer_base": "api3",
     "routing_strategy": "fill_first",
+    # Keep successive turns of one conversation on the same pooled account so
+    # upstream prefix caching stays warm. A preference only: an expired pin or
+    # an unroutable account falls through to the normal strategy.
+    "conversation_affinity": True,
 }
 
 _cache: dict[str, SettingValue] = {

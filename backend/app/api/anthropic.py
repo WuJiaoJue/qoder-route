@@ -28,6 +28,7 @@ from app.services import direct_client
 from app.services.request_log import RequestTrace, log_outcome
 from app.services.qoder_client import resolve_model_level
 from app.services.model_catalog import is_free_model
+from app.services.conversation_affinity import derive_conversation_key
 from app.services.quota_service import (
     looks_like_transient_stream_error,
     parse_model_queue,
@@ -393,13 +394,17 @@ async def create_message(
     tool_choice = _convert_tool_choice(body.tool_choice)
     reasoning_effort = _reasoning_effort_from_thinking(body.thinking)
     session_id = _client_session_id(request.headers)
+    conversation_key = derive_conversation_key(session_id, messages_dicts)
     tried_ids: set[int] = set()
     model_level = _resolve_level(body.model)
     trace = RequestTrace("anthropic", model_level)
     free_model = is_free_model(model_level)
 
     for _ in range(MAX_SWAP_ATTEMPTS):
-        account = await pool.get_next_account(db, exclude_ids=tried_ids, free_model=free_model)
+        account = await pool.get_next_account(
+            db, exclude_ids=tried_ids, free_model=free_model,
+            conversation_key=conversation_key,
+        )
         if not account:
             break
 

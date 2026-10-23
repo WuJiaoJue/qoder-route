@@ -15,7 +15,7 @@ from app.models.account import Account
 from app.models.pool_counter import PoolCounter, CREDITS_SPENT_KEY
 from app.services import settings_service
 from app.core.config import settings
-from app.services import quota_service, logbus
+from app.services import quota_service, logbus, conversation_affinity as affinity
 
 logger = logging.getLogger("qoderroute.pool")
 
@@ -169,7 +169,11 @@ class AccountPool:
 
             self._last_refresh = _utcnow()
 
-    def _order_candidates(self, accounts: list[Account]) -> list[Account]:
+    def _order_candidates(
+        self,
+        accounts: list[Account],
+        conversation_key: Optional[str] = None,
+    ) -> list[Account]:
         """Order routable candidates by the configured routing strategy.
 
         Ordering happens here rather than in the SQL ``ORDER BY`` because the
@@ -204,7 +208,22 @@ class AccountPool:
                 key=lambda a: (-a.priority, a.total_requests or 0, a.id),
             )
 
-        # fill_first (default): keep the SQL order `priority DESC, id ASC`.
+        if strategy == "by_conversation" and conversation_key:
+            # Rotate each priority tier so different conversations start on
+            # different accounts, while one conversation always starts on the
+            # same account. Rotating (rather than picking a single shard) keeps
+            # the rest of the tier behind the target, so the caller's existing
+            # fall-through covers an unroutable shard with no extra code: a cold,
+            # parked or cooled shard simply yields to the next account in the ring.
+            rotated: list[Account] = []
+            for prio in sorted({a.priority for a in accounts}, reverse=True):
+                tier = [a for a in accounts if a.priority == prio]
+                offset = affinity.shard_offset(conversation_key, len(tier))
+                rotated.extend(tier[offset:] + tier[:offset])
+            return rotated
+
+        # fill_first (default), and by_conversation with no conversation key:
+        # keep the SQL order `priority DESC, id ASC`.
         return accounts
 
     async def get_next_account(
@@ -213,6 +232,7 @@ class AccountPool:
         exclude_ids: Optional[set[int]] = None,
         *,
         free_model: bool = False,
+        conversation_key: Optional[str] = None,
     ) -> Optional[Account]:
         """Pick and lease the next account for a request.
 
@@ -229,12 +249,36 @@ class AccountPool:
         widens the credit gate: paid accounts with 0 credits remain routable
         for it. Exhausted free-tier accounts are still excluded.
 
+        ``conversation_key`` enables account stickiness: when a previous turn of
+        the same conversation ran on a still-routable account, that account is
+        preferred so upstream prefix caching stays warm. It is a preference, not
+        a lock — an expired pin, an excluded id (a request just failed there) or
+        an unroutable account falls through to the strategy below and re-pins.
+
         The returned account is already leased (``_in_flight`` incremented).
         The caller must ``end_request`` or hand the lease to the SSE generator.
         """
         await self._refresh_if_stale()
 
         now = _utcnow()
+
+        # Affinity first, in its own lock section: taking the pool lock twice in
+        # one call would deadlock, so this returns before the main block runs.
+        if conversation_key and settings_service.get("conversation_affinity"):
+            pinned = affinity.store.get(conversation_key)
+            if pinned and not (exclude_ids and pinned in exclude_ids):
+                fresh = await session.get(Account, pinned)
+                if fresh and _row_is_routable(fresh, free_model=free_model):
+                    async with self._in_flight_lock:
+                        # Re-check under the lock: another task may have pinned a
+                        # different account, or the lease state just changed.
+                        if affinity.store.get(conversation_key) == pinned:
+                            self._in_flight[pinned] = self._in_flight.get(pinned, 0) + 1
+                            return fresh
+                else:
+                    # Stale preference; drop it so the next turn does not retry it.
+                    affinity.store.unpin_account(pinned)
+
         if free_model:
             # Paid accounts with 0 remaining credits are routable for free
             # models (Efficient/Lite) even though ``is_available`` is False
@@ -300,7 +344,7 @@ class AccountPool:
         if not available:
             return None
 
-        available = self._order_candidates(available)
+        available = self._order_candidates(available, conversation_key)
         # Pick + lease under the same lock so two concurrent starts cannot
         # both stick to a near-empty PAT while a healthy spare sits idle.
         # Caller must ``end_request`` (or transfer the lease to the SSE).
@@ -321,6 +365,11 @@ class AccountPool:
                 if not fresh or not _row_is_routable(fresh, free_model=free_model):
                     continue
                 self._in_flight[fresh.id] = self._in_flight.get(fresh.id, 0) + 1
+                # Only record a pin while the feature is on. Otherwise turning it
+                # back on would resurrect preferences accumulated while disabled,
+                # and a disabled feature would still consume the bounded store.
+                if settings_service.get("conversation_affinity"):
+                    affinity.store.pin(conversation_key, fresh.id)
                 return fresh
             return None
 

@@ -19,7 +19,8 @@ class SettingsUpdate(BaseModel):
     accounts_show_requests: Optional[bool] = None
     accounts_auto_delete_exhausted: Optional[bool] = None
     qoder_infer_base: Optional[Literal["api1", "api2", "api3"]] = None
-    routing_strategy: Optional[Literal["fill_first", "spread", "least_used"]] = None
+    routing_strategy: Optional[Literal["fill_first", "spread", "least_used", "by_conversation"]] = None
+    conversation_affinity: Optional[bool] = None
 
 
 @router.get("")
