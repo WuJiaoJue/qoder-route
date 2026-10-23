@@ -65,12 +65,25 @@ async def _migrate_account_quota_columns(conn):
         "quota_expires_at": "FLOAT",
         "quota_fetched_at": "FLOAT",
         "machine_id": "VARCHAR(36)",
+        # Operator enable/disable switch. Defaults to 1 so every pre-existing
+        # row keeps routing exactly as before the upgrade.
+        "enabled": "BOOLEAN DEFAULT 1",
+        # Per-account credit reserve (0 = no reserve). Defaults to 0 so existing
+        # rows keep routing exactly as before.
+        "reserve_credits": "INTEGER DEFAULT 0",
     }
     result = await conn.execute(text("PRAGMA table_info(accounts)"))
     existing = {row[1] for row in result.fetchall()}
     for name, col_type in new_columns.items():
         if name not in existing:
             await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN {name} {col_type}"))
+    # SQLite stores a literal NULL for rows that predate a DEFAULTed column, so
+    # normalise it: routing gates on `enabled == True`, and NULL would silently
+    # drop every legacy account out of rotation.
+    await conn.execute(text("UPDATE accounts SET enabled = 1 WHERE enabled IS NULL"))
+    # Same NULL hazard for the reserve: a NULL would make the "> reserve"
+    # comparison never true and silently drop the account from paid routing.
+    await conn.execute(text("UPDATE accounts SET reserve_credits = 0 WHERE reserve_credits IS NULL"))
     # Backfill machine_id for accounts created before the column existed.
     await _backfill_machine_ids(conn)
 

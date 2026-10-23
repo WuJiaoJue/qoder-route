@@ -13,13 +13,42 @@ class AccountCreate(BaseModel):
     default_model: str = ""
 
 
+# Routing-order bounds. Wide enough for any real operator intent, narrow enough
+# that a typo (an extra digit) cannot silently pin an account to the top.
+PRIORITY_MIN = -100
+PRIORITY_MAX = 100
+
+# A reserve equal to a plan's whole allowance would park every paid account and
+# leave only free models, so it is capped below the smallest paid plan (3,000).
+MAX_QUOTA_RESERVE = 2000
+
+
+class AccountUpdate(BaseModel):
+    """Partial update — only fields present in the request body are changed.
+
+    `pat_token` is deliberately absent: rotating a PAT must go through the
+    create path so `/userinfo` validation and the uniqueness check run.
+    `model_level` is absent too — it is always `'auto'` and is not a routing
+    dimension (see AGENTS.md).
+    """
+
+    name: Optional[str] = Field(None, min_length=1, max_length=128)
+    priority: Optional[int] = Field(None, ge=PRIORITY_MIN, le=PRIORITY_MAX)
+    default_model: Optional[str] = Field(None, max_length=64)
+    enabled: Optional[bool] = None
+    # Credits to keep in hand on THIS account (0 = no reserve).
+    reserve_credits: Optional[int] = Field(None, ge=0, le=MAX_QUOTA_RESERVE)
+
+
 class AccountOut(BaseModel):
     id: int
     name: str
     pat_short: str
     is_active: bool
     is_available: bool
+    enabled: bool = True
     priority: int
+    reserve_credits: int = 0
     model_level: str
     default_model: str
     last_used_at: Optional[datetime] = None
@@ -105,6 +134,7 @@ class DashboardStats(BaseModel):
     available_now: int
     accounts_in_cooldown: int
     accounts_exhausted: int = 0
+    accounts_disabled: int = 0
     total_requests: int
     total_tokens: int
     credits_spent: float = 0.0

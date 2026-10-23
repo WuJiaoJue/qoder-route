@@ -17,6 +17,15 @@ SettingValue = bool | str | int | list[str]
 
 _QODER_INFER_BASES = frozenset({"api1", "api2", "api3"})
 
+# How the pool picks the next PAT. Ordering is applied in Python (not SQL)
+# because `spread` depends on live in-flight counts, which only exist in memory.
+#   fill_first — highest priority, then lowest id. Default: sticks to one PAT so
+#                a near-empty account's remaining credit is not scattered.
+#   spread     — fewest in-flight requests first, then most remaining credit.
+#                Useful for bursts / parallel agents: no single PAT gets stacked.
+#   least_used — fewest lifetime requests first, then lowest id. Evens out wear.
+ROUTING_STRATEGIES = frozenset({"fill_first", "spread", "least_used"})
+
 _DEFAULTS: dict[str, SettingValue] = {
     "worker_logs_enabled": True,
     "worker_retry_allow": False,
@@ -26,6 +35,7 @@ _DEFAULTS: dict[str, SettingValue] = {
     "accounts_show_requests": True,
     "accounts_auto_delete_exhausted": False,
     "qoder_infer_base": "api3",
+    "routing_strategy": "fill_first",
 }
 
 _cache: dict[str, SettingValue] = {
@@ -45,9 +55,28 @@ def _normalize_value(key: str, value: object) -> Optional[SettingValue]:
         if value == "false":
             return False
         return None
+    if isinstance(default, int) and not isinstance(default, bool):
+        # Values round-trip through the key/value table as strings, so accept
+        # both an int (from the API) and a numeric string (from storage).
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed
     if key == "qoder_infer_base" and isinstance(value, str):
         candidate = value.strip().lower()
         if candidate in _QODER_INFER_BASES:
+            return candidate
+    if key == "routing_strategy" and isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in ROUTING_STRATEGIES:
             return candidate
     return None
 

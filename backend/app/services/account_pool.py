@@ -30,17 +30,77 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _row_is_routable(acc: Account, now: Optional[datetime] = None) -> bool:
-    """Fresh check: still active, available, and not parked/exhausted."""
+def _below_reserve(acc: Account, free_model: bool) -> bool:
+    """Would spending on this account eat into its reserved credits?
+
+    The reserve is per-account (``Account.reserve_credits``, 0 = off) because
+    plans differ — a 3,000-credit plan and a free-tier row cannot share one
+    number.
+
+    Applies only to PAID models on PAID accounts:
+      * a free model (Efficient/Lite) costs nothing, so the reserve is
+        irrelevant — and gating it would remove the last fallback;
+      * a free-tier row reports ``quota_remaining = 0/0``, which says nothing
+        about its real (resource-pack) balance, so a numeric reserve must not
+        silently exclude it.
+    """
+    if free_model or not acc.is_paid:
+        return False
+    reserve = acc.reserve_credits
+    if not isinstance(reserve, (int, float)) or reserve <= 0:
+        return False
+    remaining = acc.quota_remaining
+    if not isinstance(remaining, (int, float)):
+        return False
+    return float(remaining) <= float(reserve)
+
+
+def _row_is_routable(
+    acc: Account,
+    now: Optional[datetime] = None,
+    *,
+    free_model: bool = False,
+) -> bool:
+    """Fresh check: still active, available, and not parked/exhausted.
+
+    ``free_model`` bypasses the credit gate for models free inside a paid plan
+    (e.g. Efficient / Lite): a paid account with 0 remaining credits may still
+    serve them. Free-tier accounts (``is_paid == False``) are exempt from the
+    local credit gate entirely — the quota API cannot see personal resource
+    packs, so upstream errors are the real feedback loop.
+    """
     if now is None:
         now = _utcnow()
-    if not acc.is_active or not acc.is_available or acc.is_quota_exceeded:
+    # Operator switch wins over everything else: a disabled account is never
+    # routable, regardless of quota, cooldown or free-model exemptions.
+    if not acc.enabled:
+        return False
+    # ``is_available`` is informational (parked when exhausted). A paid
+    # account serving a free model may be parked yet still routable.
+    if not acc.is_active:
+        return False
+    if not acc.is_available and not (free_model and acc.is_paid):
+        return False
+    # Exhausted parked accounts stay parked for paid models; a free model on a
+    # paid account is allowed through (upstream charges 0 credits). Free-tier
+    # parked accounts stay parked (upstream quota error → park → excluded).
+    if acc.is_quota_exceeded and not (free_model and acc.is_paid):
         return False
     if acc.cooldown_until is not None and acc.cooldown_until > now:
         return False
     if acc.consecutive_failures >= settings.max_consecutive_failures:
         return False
-    if acc.quota_remaining is not None and acc.quota_remaining <= 0:
+    # Free-tier accounts: the quota API cannot see personal resource packs,
+    # so the local credit gate does not apply to them; upstream errors are
+    # the real feedback loop (quota error → park → excluded until refresh).
+    if (
+        acc.quota_remaining is not None
+        and acc.quota_remaining <= 0
+        and not ((free_model and acc.is_paid) or not acc.is_paid)
+    ):
+        return False
+    # Operator reserve: stop spending a paid account before it is drained.
+    if _below_reserve(acc, free_model):
         return False
     return True
 
@@ -52,7 +112,7 @@ class AccountPool:
         self._in_flight_lock = asyncio.Lock()
         self._in_flight: dict[int, int] = {}
 
-    async def begin_request(self, account_id: int) -> bool:
+    async def begin_request(self, account_id: int, *, free_model: bool = False) -> bool:
         """Claim a specific account for one in-flight request.
 
         Routing should use ``get_next_account``, which picks and leases
@@ -61,7 +121,7 @@ class AccountPool:
         """
         async with async_session() as session:
             acc = await session.get(Account, account_id)
-            if not acc or not _row_is_routable(acc):
+            if not acc or not _row_is_routable(acc, free_model=free_model):
                 return False
         async with self._in_flight_lock:
             self._in_flight[account_id] = self._in_flight.get(account_id, 0) + 1
@@ -99,7 +159,7 @@ class AccountPool:
                     if acc.consecutive_failures:
                         acc.consecutive_failures = 0
                     changed = True
-                should_be = not in_cooldown and not acc.is_quota_exceeded
+                should_be = acc.enabled and not in_cooldown and not acc.is_quota_exceeded
                 if acc.is_available != should_be:
                     acc.is_available = should_be
                     changed = True
@@ -109,16 +169,65 @@ class AccountPool:
 
             self._last_refresh = _utcnow()
 
+    def _order_candidates(self, accounts: list[Account]) -> list[Account]:
+        """Order routable candidates by the configured routing strategy.
+
+        Ordering happens here rather than in the SQL ``ORDER BY`` because the
+        `spread` strategy ranks on live in-flight counts, which exist only in
+        this process's memory. The SQL order (`priority DESC, id ASC`) is kept
+        anyway: it is the deterministic tie-break for every strategy, so the
+        query stays the single source of truth for the *filter*.
+
+        `priority` is honoured first under every strategy — it is an explicit
+        operator override, so a higher-priority account must win regardless of
+        load. Strategies only reorder *within* equal priority.
+        """
+        strategy = str(settings_service.get("routing_strategy") or "fill_first")
+
+        if strategy == "spread":
+            # Fewest in-flight first, then the most remaining credit (so a
+            # burst lands on the healthiest spare), then the SQL tie-break.
+            return sorted(
+                accounts,
+                key=lambda a: (
+                    -a.priority,
+                    self._in_flight.get(a.id, 0),
+                    -(a.quota_remaining if isinstance(a.quota_remaining, (int, float)) else 0.0),
+                    a.id,
+                ),
+            )
+
+        if strategy == "least_used":
+            # Fewest lifetime requests first, so wear is distributed evenly.
+            return sorted(
+                accounts,
+                key=lambda a: (-a.priority, a.total_requests or 0, a.id),
+            )
+
+        # fill_first (default): keep the SQL order `priority DESC, id ASC`.
+        return accounts
+
     async def get_next_account(
         self,
         session: AsyncSession,
         exclude_ids: Optional[set[int]] = None,
+        *,
+        free_model: bool = False,
     ) -> Optional[Account]:
-        """Fill-first routing: the first available account WITH quota wins.
+        """Pick and lease the next account for a request.
+
+        Default strategy is fill-first (the first available account WITH quota
+        wins); `routing_strategy` can switch this to `spread` or `least_used`,
+        which reorder candidates within equal priority — see
+        `_order_candidates`.
 
         Near exhaustion, only one in-flight request may stay on the dying
         account; additional concurrent starts spill to the next PAT so a
         burst does not all fail together.
+
+        ``free_model`` (a model free inside a paid plan, e.g. Efficient/Lite)
+        widens the credit gate: paid accounts with 0 credits remain routable
+        for it. Exhausted free-tier accounts are still excluded.
 
         The returned account is already leased (``_in_flight`` incremented).
         The caller must ``end_request`` or hand the lease to the SSE generator.
@@ -126,21 +235,62 @@ class AccountPool:
         await self._refresh_if_stale()
 
         now = _utcnow()
-        stmt = (
-            select(Account)
-            .where(Account.is_active == True, Account.is_available == True)
-            .where(Account.is_quota_exceeded == False)
-            .where(
-                (Account.quota_remaining == None)
-                | (Account.quota_remaining > 0)
+        if free_model:
+            # Paid accounts with 0 remaining credits are routable for free
+            # models (Efficient/Lite) even though ``is_available`` is False
+            # (parked); the fine-grained gate lives in _row_is_routable.
+            # Free-tier accounts are also routable when available and not
+            # quota-exceeded (parked free accounts stay excluded).
+            stmt = (
+                select(Account)
+                .where(Account.is_active == True, Account.enabled == True)
+                .where(
+                    (Account.is_paid == True)
+                    | (
+                        (Account.is_paid == False)
+                        & (Account.is_available == True)
+                        & (Account.is_quota_exceeded == False)
+                    )
+                )
+                .where(
+                    (Account.cooldown_until == None)
+                    | (Account.cooldown_until < now)
+                )
+                .where(Account.consecutive_failures < settings.max_consecutive_failures)
+                .order_by(Account.priority.desc(), Account.id.asc())
             )
-            .where(
-                (Account.cooldown_until == None)
-                | (Account.cooldown_until < now)
+        else:
+            stmt = (
+                select(Account)
+                .where(Account.is_active == True, Account.enabled == True)
+                .where(Account.is_available == True)
+                .where(Account.is_quota_exceeded == False)
+                .where(
+                    (Account.quota_remaining == None)
+                    | (Account.quota_remaining > 0)
+                    # Free-tier rows carry a 0/0 quota that hides personal
+                    # resource-pack credits; let upstream verdicts gate them.
+                    | (Account.is_paid == False)
+                )
+                .where(
+                    (Account.cooldown_until == None)
+                    | (Account.cooldown_until < now)
+                )
+                .where(Account.consecutive_failures < settings.max_consecutive_failures)
+                .order_by(Account.priority.desc(), Account.id.asc())
             )
-            .where(Account.consecutive_failures < settings.max_consecutive_failures)
-            .order_by(Account.priority.desc(), Account.id.asc())
-        )
+            # Per-account reserve (paid models only). Applied in SQL as well as
+            # in `_row_is_routable` so a reserved account cannot win ordering
+            # and then be skipped. Always applied — the comparison against each
+            # row's own `reserve_credits` is a no-op when that value is 0.
+            # Free-tier rows are exempt: their 0/0 quota says nothing about
+            # real resource-pack credits.
+            stmt = stmt.where(
+                (Account.is_paid == False)
+                | (Account.reserve_credits <= 0)
+                | (Account.quota_remaining == None)
+                | (Account.quota_remaining > Account.reserve_credits)
+            )
         result = await session.execute(stmt)
         available = list(result.scalars().all())
 
@@ -150,21 +300,25 @@ class AccountPool:
         if not available:
             return None
 
+        available = self._order_candidates(available)
         # Pick + lease under the same lock so two concurrent starts cannot
         # both stick to a near-empty PAT while a healthy spare sits idle.
         # Caller must ``end_request`` (or transfer the lease to the SSE).
         async with self._in_flight_lock:
             for idx, acc in enumerate(available):
                 remaining = acc.quota_remaining
-                near_empty = (
-                    isinstance(remaining, (int, float))
-                    and remaining <= _NEAR_EMPTY_CREDITS
-                )
-                has_fallback = idx + 1 < len(available)
-                if near_empty and self._in_flight.get(acc.id, 0) > 0 and has_fallback:
-                    continue
+                # Free-model routing: a paid account with 0 credits is solidly
+                # usable, so skip the near-empty spill heuristic entirely.
+                if not free_model:
+                    near_empty = (
+                        isinstance(remaining, (int, float))
+                        and remaining <= _NEAR_EMPTY_CREDITS
+                    )
+                    has_fallback = idx + 1 < len(available)
+                    if near_empty and self._in_flight.get(acc.id, 0) > 0 and has_fallback:
+                        continue
                 fresh = await session.get(Account, acc.id)
-                if not fresh or not _row_is_routable(fresh):
+                if not fresh or not _row_is_routable(fresh, free_model=free_model):
                     continue
                 self._in_flight[fresh.id] = self._in_flight.get(fresh.id, 0) + 1
                 return fresh
@@ -221,7 +375,9 @@ class AccountPool:
             acc.last_error_message = None
             # Un-park: quota came back, so the account rejoins routing right
             # away instead of waiting for the next pool refresh sweep.
-            acc.is_available = True
+            # `enabled` still wins: refreshing quota must never resurrect an
+            # account the operator took out of rotation.
+            acc.is_available = bool(acc.enabled)
             acc.cooldown_until = None
             acc.consecutive_failures = 0
 
@@ -357,7 +513,7 @@ class AccountPool:
                 acc.last_used_at = _utcnow()
                 acc.consecutive_failures = 0
                 acc.last_error_message = None
-                acc.is_available = not acc.is_quota_exceeded
+                acc.is_available = acc.enabled and not acc.is_quota_exceeded
                 acc.cooldown_until = None
 
                 # Counters via SQL expressions — concurrent completions on the
@@ -411,7 +567,7 @@ class AccountPool:
                             quota_used=func.coalesce(Account.quota_used, 0.0)
                             + float(credits_used),
                         )
-                        .returning(Account.quota_remaining, Account.is_quota_exceeded)
+                        .returning(Account.quota_remaining, Account.is_quota_exceeded, Account.is_paid)
                         .execution_options(synchronize_session=False)
                     )
                     row = result.first()
@@ -419,11 +575,15 @@ class AccountPool:
                     # parked (or auto-deleted) the account must not park it a
                     # second time: that duplicates the pool event and, with
                     # auto-delete on, issues a DELETE for a row that is gone.
+                    # Free-tier accounts carry a 0/0 quota (personal resource
+                    # packs are invisible to the quota API); local drain must
+                    # not park them — upstream errors are the real feedback.
                     drained = (
                         row is not None
                         and row[0] is not None
                         and row[0] <= 0
                         and not bool(row[1])
+                        and bool(row[2])
                     )
                     session.expire(acc, ["quota_remaining", "quota_used"])
                     if drained:
@@ -462,6 +622,7 @@ class AccountPool:
                         Account.consecutive_failures,
                         Account.is_quota_exceeded,
                         Account.name,
+                        Account.enabled,
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -472,6 +633,7 @@ class AccountPool:
                 new_failures = int(row[0] or 0)
                 is_exceeded = bool(row[1])
                 name = row[2]
+                is_enabled = bool(row[3])
                 cooldown_until = None
                 is_available = True
                 if new_failures >= settings.max_consecutive_failures:
@@ -490,8 +652,9 @@ class AccountPool:
                     .where(Account.id == account_id)
                     .values(
                         cooldown_until=cooldown_until,
-                        # Exhausted accounts stay parked — failures don't revive them.
-                        is_available=is_available and not is_exceeded,
+                        # Exhausted accounts stay parked — failures don't revive
+                        # them; neither does a failure revive a disabled account.
+                        is_available=is_available and not is_exceeded and is_enabled,
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -519,6 +682,64 @@ class AccountPool:
 
     async def get_account_by_id(self, session: AsyncSession, account_id: int) -> Optional[Account]:
         return await session.get(Account, account_id)
+
+    async def update_account(
+        self,
+        session: AsyncSession,
+        account_id: int,
+        *,
+        name: Optional[str] = None,
+        priority: Optional[int] = None,
+        default_model: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        reserve_credits: Optional[int] = None,
+    ) -> Optional[Account]:
+        """Partial update of the operator-controlled fields.
+
+        Disabling is authoritative but never destroys other state: quota,
+        cooldown and failure counters are left untouched so a later re-enable
+        restores the account exactly as it was. Re-enabling deliberately does
+        NOT clear ``is_quota_exceeded`` — an exhausted account stays parked
+        until quota actually returns.
+
+        Returns the updated row, or ``None`` when the id is unknown.
+        """
+        acc = await session.get(Account, account_id)
+        if not acc:
+            return None
+
+        if name is not None:
+            acc.name = name
+        if priority is not None:
+            acc.priority = priority
+        if default_model is not None:
+            acc.default_model = default_model
+        if reserve_credits is not None:
+            acc.reserve_credits = max(0, int(reserve_credits))
+        if enabled is not None:
+            acc.enabled = enabled
+            # Keep the derived flag consistent immediately rather than waiting
+            # for the next `_refresh` sweep, so the panel and routing agree.
+            acc.is_available = bool(enabled) and not bool(acc.is_quota_exceeded)
+            if enabled and acc.cooldown_until is not None and acc.cooldown_until <= _utcnow():
+                # A served cooldown no longer applies; mirror `_refresh`.
+                acc.cooldown_until = None
+                acc.consecutive_failures = 0
+
+        await session.commit()
+        await session.refresh(acc)
+
+        action = "updated"
+        if enabled is not None:
+            action = "enabled" if enabled else "disabled"
+        logbus.push(
+            "info", "pool",
+            f"account {action}: {acc.name} (id {acc.id})",
+            action=action,
+            account_id=acc.id,
+            account_name=acc.name,
+        )
+        return acc
 
     async def add_account(
         self, session: AsyncSession, name: str, pat_token: str,
@@ -603,11 +824,15 @@ class AccountPool:
         spent_stmt = select(PoolCounter.value).where(PoolCounter.key == CREDITS_SPENT_KEY)
         credits_spent = (await session.execute(spent_stmt)).scalar() or 0.0
 
+        disabled_stmt = select(func.count(Account.id)).where(Account.enabled == False)
+        disabled_count = (await session.execute(disabled_stmt)).scalar() or 0
+
         return {
             "total_accounts": row.total or 0,
             "active_accounts": active_count,
             "available_now": available_now,
             "accounts_in_cooldown": in_cooldown,
+            "accounts_disabled": disabled_count,
             "total_requests": row.total_req or 0,
             "total_tokens": row.total_tok or 0,
             "credits_spent": credits_spent,

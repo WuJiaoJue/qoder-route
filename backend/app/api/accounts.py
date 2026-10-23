@@ -2,17 +2,18 @@ import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import and_, select
+from sqlalchemy import Integer, and_, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import async_session, get_db
+from app.models.request_summary import RequestSummary
 from app.models.schemas import (
-    AccountCreate, AccountOut, AccountPoolStatus, DashboardStats
+    AccountCreate, AccountOut, AccountPoolStatus, AccountUpdate, DashboardStats
 )
 from app.models.account import Account
 from app.services.account_pool import pool
-from app.services.qoder_client import validate_pat, QODER_MODEL_DISPLAY
+from app.services.qoder_client import validate_pat, qoder_model_display
 from app.services import logbus
 from app.services import quota_service
 
@@ -42,83 +43,137 @@ def _is_completion(e: dict) -> bool:
     return e.get("message") in _COMPLETION_MESSAGES
 
 
-@router.get("/stats/activity")
-async def dashboard_activity():
-    """Recent chat traffic aggregated from the in-memory log bus.
+# Traffic window presets: label -> (seconds, bucket size). Buckets grow with the
+# window so the series stays ~60-96 points at every scale.
+_ACTIVITY_WINDOWS: dict[str, tuple[int, int]] = {
+    "1h": (3600, 60),
+    "6h": (6 * 3600, 5 * 60),
+    "24h": (24 * 3600, 15 * 60),
+}
 
-    Covers the last 60 minutes (or since server start, whichever is shorter):
-    per-minute request/token series plus per-model usage totals. Tokens are
-    completion tokens, matching the lifetime counters on accounts.
+
+@router.get("/stats/activity")
+async def dashboard_activity(window: str = "1h"):
+    """Chat traffic over a window, aggregated from the persisted request table.
+
+    Reads `request_summaries` (24h retention) rather than the in-memory log bus:
+    the ring buffer holds only 5 000 lines and the hydrated request index only
+    2 000 rows, so a 6h or 24h window would silently under-report. Aggregating in
+    SQL is both exact and restart-proof — the chart no longer blanks on reload.
+
+    Counts completions (`phase=done` + `outcome=ok`), matching the Requests view.
+    Tokens are completion tokens, matching the lifetime counters on accounts.
     """
+    spec = _ACTIVITY_WINDOWS.get(window)
+    if spec is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown window '{window}'; expected one of {sorted(_ACTIVITY_WINDOWS)}",
+        )
+    window_sec, bucket_sec = spec
+
     now = time.time()
-    window_sec = 3600
-    bucket_sec = 60
     n_buckets = window_sec // bucket_sec
-    # Align buckets to whole wall-clock minutes. A floating `now`-anchored
-    # window makes bucket edges drift on every poll — the chart morphs even
-    # with zero new traffic.
+    # Align buckets to whole wall-clock units. A floating `now`-anchored window
+    # moves bucket edges on every poll, so the chart morphs even with no traffic.
     end = int(now // bucket_sec) * bucket_sec
     start = end - window_sec
 
     series = [
-        {"t": start + i * bucket_sec, "requests": 0, "tokens": 0}
+        {"t": start + i * bucket_sec, "requests": 0, "tokens": 0, "credits": 0.0}
         for i in range(n_buckets + 1)
     ]
     by_model: dict[str, dict] = {}
     totals = {"requests": 0, "tokens": 0, "credits": 0.0}
 
-    seen: set[str] = set()
-
-    def _count(e: dict, ts: float) -> None:
-        nonlocal totals
-        tokens = int(e.get("completion_tokens") or 0)
-        credits = float(e.get("credits") or 0.0)
-        idx = min(int((ts - start) // bucket_sec), n_buckets)
-        series[idx]["requests"] += 1
+    def _add(bucket_ts: float, requests: int, tokens: int, credits: float, model: str | None) -> None:
+        idx = min(max(int((bucket_ts - start) // bucket_sec), 0), n_buckets)
+        series[idx]["requests"] += requests
         series[idx]["tokens"] += tokens
-        totals["requests"] += 1
+        series[idx]["credits"] += credits
+        totals["requests"] += requests
         totals["tokens"] += tokens
         totals["credits"] += credits
+        if model:
+            slot = by_model.setdefault(model, {"model": model, "requests": 0, "tokens": 0, "credits": 0.0})
+            slot["requests"] += requests
+            slot["tokens"] += tokens
+            slot["credits"] += credits
 
-        key = str(e.get("model") or "unknown")
-        slot = by_model.setdefault(key, {"model": key, "requests": 0, "tokens": 0, "credits": 0.0})
-        slot["requests"] += 1
-        slot["tokens"] += tokens
-        slot["credits"] += credits
+    # Bucket index computed in SQL: integer division of the offset from `start`.
+    bucket_idx = cast((RequestSummary.ts - start) / bucket_sec, Integer)
+    completed = and_(
+        RequestSummary.ts >= start,
+        # Upper bound is one bucket past the aligned window end so the bucket
+        # currently in progress is included (clamped into the final slot by
+        # _add). Cutting exactly at `end` would hide up to a full bucket of
+        # fresh traffic and make the chart lag the Requests log.
+        RequestSummary.ts < end + bucket_sec,
+        RequestSummary.phase == "done",
+        RequestSummary.outcome == "ok",
+    )
 
-    for e in logbus.recent(limit=5000):
-        if not _is_completion(e):
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(
+                bucket_idx.label("b"),
+                RequestSummary.model,
+                func.count().label("n"),
+                func.coalesce(func.sum(RequestSummary.completion_tokens), 0),
+                func.coalesce(func.sum(RequestSummary.credits), 0.0),
+            )
+            .where(completed)
+            .group_by("b", RequestSummary.model)
+        )).all()
+
+        for b, model, n, tokens, credits in rows:
+            _add(start + int(b) * bucket_sec, int(n), int(tokens), float(credits), model)
+
+        # A completion is persisted fire-and-forget at terminal event time, so the
+        # newest rows can lag by a beat. Overlay only those live completions that
+        # are not in the table yet, so the chart stays current without double count.
+        live = [
+            e for e in logbus.recent(limit=5000)
+            if _is_completion(e) and float(e.get("ts") or 0) >= end - 2 * bucket_sec
+        ]
+        live_ids = {str(e.get("request_id") or "") for e in live} - {""}
+        already: set[str] = set()
+        if live_ids:
+            already = {
+                r[0] for r in (await session.execute(
+                    select(RequestSummary.request_id).where(
+                        RequestSummary.request_id.in_(live_ids)
+                    )
+                )).all()
+            }
+
+    for e in live:
+        rid = str(e.get("request_id") or "")
+        if not rid or rid in already:
             continue
         ts = float(e.get("ts") or 0)
-        if ts < start:
+        if not start <= ts < end + bucket_sec:
             continue
-        rid = str(e.get("request_id") or f"seq:{e.get('seq')}")
-        if rid in seen:
-            continue
-        seen.add(rid)
-        _count(e, ts)
+        already.add(rid)
+        _add(
+            ts, 1,
+            int(e.get("completion_tokens") or 0),
+            float(e.get("credits") or 0.0),
+            str(e.get("model") or "") or None,
+        )
 
-    # Hydrated SQLite summaries after a restart — the ring buffer is empty
-    # but these rows still feed the Usage charts.
-    for r in logbus.requests(limit=2000):
-        if r.get("outcome") != "ok":
-            continue
-        ts = float(r.get("last_ts") or r.get("ts") or 0)
-        if ts < start:
-            continue
-        rid = str(r.get("request_id") or "")
-        if not rid or rid in seen:
-            continue
-        seen.add(rid)
-        _count(r, ts)
-
-    display = {key: name for name, key in QODER_MODEL_DISPLAY}
+    # Live accessor: the effective catalog may have been synced.
+    display = {key: name for name, key in qoder_model_display()}
     models = sorted(by_model.values(), key=lambda m: m["requests"], reverse=True)
     for m in models:
         m["display"] = display.get(m["model"], m["model"])
         m["credits"] = round(m["credits"], 2)
+    for point in series:
+        point["credits"] = round(point["credits"], 2)
 
     return {
+        "window_key": window,
+        "window_sec": window_sec,
         "bucket_sec": bucket_sec,
         "series": series,
         "by_model": models,
@@ -142,6 +197,7 @@ async def dashboard_stats(db: AsyncSession = Depends(get_db)):
         available_now=stats["available_now"],
         accounts_in_cooldown=stats["accounts_in_cooldown"],
         accounts_exhausted=exhausted,
+        accounts_disabled=stats["accounts_disabled"],
         total_requests=stats["total_requests"],
         total_tokens=stats["total_tokens"],
         credits_spent=stats["credits_spent"],
@@ -185,9 +241,15 @@ async def list_available_accounts(db: AsyncSession = Depends(get_db)):
     stmt = select(Account).where(
         and_(
             Account.is_active == True,
+            # Mirrors the routing gate: a disabled account is never "available".
+            Account.enabled == True,
             Account.is_available == True,
             Account.is_quota_exceeded == False,
-            (Account.quota_remaining.is_(None)) | (Account.quota_remaining > 0),
+            (Account.quota_remaining.is_(None))
+            | (Account.quota_remaining > 0)
+            # Free-tier rows carry a 0/0 quota that hides personal
+            # resource-pack credits; show them as available.
+            | (Account.is_paid == False),
             (Account.cooldown_until.is_(None)) | (Account.cooldown_until < now),
             Account.consecutive_failures < settings.max_consecutive_failures,
         )
@@ -243,11 +305,8 @@ async def create_account(body: AccountCreate, db: AsyncSession = Depends(get_db)
             detail="Could not fetch plan/quota from Qoder — not added. Retry when the API is reachable.",
         )
     tier = str(pq.get("plan_tier") or "").strip().lower()
-    if tier == "personal_standard":
-        raise HTTPException(
-            status_code=400,
-            detail="Free plan (personal_standard) — this account has no plan. Not added.",
-        )
+    # Free-tier accounts are allowed — they can still use free models (e.g. qfmodel)
+    # that don't consume credits. Quota tracking doesn't apply to them.
 
     try:
         account = await pool.add_account(
@@ -290,6 +349,30 @@ async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
     if not success:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"ok": True}
+
+
+@router.patch("/{account_id}", response_model=AccountOut)
+async def update_account(
+    account_id: int,
+    body: AccountUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Partial update of operator-controlled fields (priority, enabled, name).
+
+    Only fields present in the request body are changed. Out-of-range
+    `priority` is rejected with 422 by schema validation rather than silently
+    clamped, so a typo is visible instead of quietly reordering routing.
+    """
+    # `exclude_unset` is what makes this a true PATCH: an explicit
+    # `{"enabled": false}` must be distinguished from an omitted field.
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=422, detail="No updatable fields provided")
+
+    acc = await pool.update_account(db, account_id, **fields)
+    if acc is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return AccountOut.model_validate(acc)
 
 
 @router.post("/{account_id}/quota/refresh")

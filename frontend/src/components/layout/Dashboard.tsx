@@ -1,11 +1,21 @@
+import { useState } from 'react'
 import { motion } from 'framer-motion'
 import { useDashboardStats, usePoolStatus, useActivityStats } from '../../hooks/useApi'
 import { Card, SectionTitle, Skeleton, HeaderBadge } from '../ui/GlassPanel'
 import { timeAgo, formatNumber } from '../../lib/utils'
 import { Activity, CircleAlert, CheckCircle2, Wallet } from 'lucide-react'
+import type { ActivityWindow } from '../../types'
 import {
   AreaChart, Area, CartesianGrid, XAxis, YAxis, ResponsiveContainer, Tooltip,
 } from 'recharts'
+
+/* Traffic chart windows. Labels drive both the chart selector and the summary
+   card, so they can never disagree with the backend's own window presets. */
+const WINDOWS: { key: ActivityWindow; label: string; card: string }[] = [
+  { key: '1h', label: '60 min', card: 'Last hour' },
+  { key: '6h', label: '6 hours', card: 'Last 6 hours' },
+  { key: '24h', label: '24 hours', card: 'Last 24 hours' },
+]
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -131,7 +141,7 @@ function TrafficChart({ series }: { series: { t: number; requests: number; token
       </ResponsiveContainer>
       {empty && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <span className="text-[11px] text-neutral-600">No traffic in the last hour</span>
+          <span className="text-[11px] text-neutral-600">No traffic in this window</span>
         </div>
       )}
     </div>
@@ -194,7 +204,9 @@ function QuotaOverview() {
 export function Dashboard() {
   const { data: stats, isLoading, error } = useDashboardStats()
   const { data: pool } = usePoolStatus()
-  const { data: activity } = useActivityStats()
+  const [win, setWin] = useState<ActivityWindow>('1h')
+  const { data: activity } = useActivityStats(win)
+  const winMeta = WINDOWS.find(w => w.key === win) ?? WINDOWS[0]
 
   const withQuota = (pool?.accounts ?? []).filter((a) => a.quota_total != null && a.quota_total > 0)
   const creditsTotal = withQuota.reduce((s, a) => s + (a.quota_total ?? 0), 0)
@@ -291,7 +303,7 @@ export function Dashboard() {
             <motion.div variants={rise}>
               <Card className="p-5 h-full">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-neutral-500 mb-2">
-                  Last hour
+                  {winMeta.card}
                 </div>
                 <div className="text-[28px] leading-none font-bold text-white tabular-nums tracking-tight">
                   {windowReq.toLocaleString()}
@@ -318,7 +330,22 @@ export function Dashboard() {
                       <span className="w-2 h-2 rounded-[2px] bg-neutral-500" />
                       tokens
                     </span>
-                    <span className="text-neutral-700 font-mono">60 min</span>
+                    <span className="inline-flex items-center gap-0.5 p-0.5 rounded-lg" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                      {WINDOWS.map(w => (
+                        <button
+                          key={w.key}
+                          type="button"
+                          onClick={() => setWin(w.key)}
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-mono transition-colors ${
+                            win === w.key
+                              ? 'bg-neutral-200 text-black'
+                              : 'text-neutral-500 hover:text-neutral-300'
+                          }`}
+                        >
+                          {w.label}
+                        </button>
+                      ))}
+                    </span>
                   </span>
                 }
               >
@@ -328,7 +355,7 @@ export function Dashboard() {
                 <TrafficChart series={series} />
               ) : (
                 <div className="h-[220px] flex items-center justify-center text-xs text-neutral-500">
-                  No traffic in the last hour
+                  No traffic in this window
                 </div>
               )}
             </Card>

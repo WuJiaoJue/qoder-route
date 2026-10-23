@@ -3,23 +3,53 @@ import os
 from typing import Optional
 
 from app.core.config import settings
-from app.services.model_catalog import MODEL_CATALOG
+from app.services import model_catalog
 
 
 def _model_slug(value: str) -> str:
     return value.lower().replace(" ", "-").replace("_", "-")
 
 
-QODER_MODEL_DISPLAY = [
-    (str(entry["name"]), str(entry["key"])) for entry in MODEL_CATALOG
-]
-QODER_MODEL_LEVELS = {
-    _model_slug(str(entry["name"])): str(entry["key"])
-    for entry in MODEL_CATALOG
-}
+# Rebuilt from the *effective* catalog (not frozen at import): a synced
+# catalog must change display-name resolution too, otherwise a model added
+# upstream would still resolve to "auto".
+def _model_display_pairs() -> list[tuple[str, str]]:
+    return [
+        (str(entry["name"]), str(entry["key"]))
+        for entry in model_catalog.effective_catalog()
+    ]
+
+
+def _model_level_map() -> dict[str, str]:
+    return {
+        _model_slug(str(entry["name"])): str(entry["key"])
+        for entry in model_catalog.effective_catalog()
+    }
+
+
+QODER_MODEL_DISPLAY = _model_display_pairs()
+_QODER_MODEL_LEVELS_BASE = _model_level_map()
+
+
+def qoder_model_levels() -> dict[str, str]:
+    """Live display-name -> level map for the *effective* catalog.
+
+    Callers must use this (not `_QODER_MODEL_LEVELS_BASE`) so a synced catalog
+    is honoured; the base map is only the startup snapshot/fallback.
+    """
+    merged = _model_level_map()
+    merged.update(_QODER_MODEL_LEVELS_ALIASES)
+    return merged
+
+
+def qoder_model_display() -> list[tuple[str, str]]:
+    """Live (display_name, key) pairs for the effective catalog."""
+    return _model_display_pairs()
+
+
 # Keep the unversioned public aliases accepted after display names gain the
 # upstream build suffix.  OpenCode model IDs intentionally remain stable.
-QODER_MODEL_LEVELS.update({
+_QODER_MODEL_LEVELS_ALIASES = {
     "deepseek-v4-pro": "dmodel",
     "deepseek-v4-flash": "dfmodel",
     "qwen3.8-flash": "qfmodel",
@@ -27,7 +57,11 @@ QODER_MODEL_LEVELS.update({
     # Retired GLM-5.2 key; keep old clients on the remaining GLM route.
     "glm-5.2": "gmodel",
     "gm51model": "gmodel",
-})
+}
+
+# Backward-compatible snapshot (baseline + aliases). Prefer qoder_model_levels(),
+# which reflects a synced catalog.
+QODER_MODEL_LEVELS = {**_QODER_MODEL_LEVELS_BASE, **_QODER_MODEL_LEVELS_ALIASES}
 # Private compatibility key previously advertised for the preview tier.  It
 # is deliberately absent from the public catalog, but existing clients that
 # send the exact ID must keep reaching it instead of silently falling to auto.
@@ -41,14 +75,16 @@ def resolve_model_level(model: str) -> str:
     if "/" in model:
         model = model.rsplit("/", 1)[-1]
     raw_key = model.strip().lower()
-    known_levels = {level for _, level in QODER_MODEL_DISPLAY} | _LEGACY_MODEL_LEVELS
+    display_pairs = qoder_model_display()
+    known_levels = {level for _, level in display_pairs} | _LEGACY_MODEL_LEVELS
     if raw_key in known_levels:
         return raw_key
 
     key = raw_key.replace(" ", "-").replace("_", "-")
-    if key in QODER_MODEL_LEVELS:
-        return QODER_MODEL_LEVELS[key]
-    for display_name, level in QODER_MODEL_DISPLAY:
+    levels = qoder_model_levels()
+    if key in levels:
+        return levels[key]
+    for display_name, level in display_pairs:
         if (
             display_name.lower().replace(" ", "-") == key
             or level.lower().replace("_", "-") == key

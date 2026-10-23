@@ -1,5 +1,11 @@
 # QoderRoute
 
+> **Fork notice.** This is a private-use fork of
+> [FieDie/qoder-route](https://github.com/FieDie/qoder-route). Upstream ships
+> **no license**, so nothing here is offered under one — see
+> [NOTICE.md](NOTICE.md) before reusing any of it. The fork's changes are
+> listed there too.
+
 QoderRoute is an OpenAI-compatible and Anthropic-compatible proxy router for Qoder (qoder.sh). It maintains a pool of Qoder accounts (via PAT tokens), accepts requests formatted for the OpenAI chat API at `/v1/chat/completions` and the Anthropic Messages API at `/v1/messages`, signs outbound requests through a Node.js WASM sidecar, forwards them to Qoder upstream endpoints (`api1/2/3.qoder.sh`), and automatically rotates between accounts when quota is exhausted. The project includes a React + TypeScript admin panel for accounts, quotas, the model catalog, live request logs via SSE, and runtime settings.
 
 ## Dashboard Preview

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import type { Account, AccountPoolStatus, ActivityStats, AppSettings, DashboardStats, ModelCatalogEntry, WorkerStatus } from '../types'
+import type { Account, AccountPoolStatus, ActivityStats, ActivityWindow, AppSettings, DashboardStats, ModelCatalogEntry, WorkerStatus } from '../types'
 
 const BASE = ''
 
@@ -59,10 +59,12 @@ export function useDashboardStats() {
   })
 }
 
-export function useActivityStats() {
+export function useActivityStats(window: ActivityWindow = '1h') {
   return useQuery<ActivityStats>({
-    queryKey: ['activity-stats'],
-    queryFn: () => api('/api/accounts/stats/activity'),
+    // The window is part of the key, so switching refetches and can never show
+    // the previous window's series under the new label.
+    queryKey: ['activity-stats', window],
+    queryFn: () => api<ActivityStats>(`/api/accounts/stats/activity?window=${window}`),
     refetchInterval: 5000,
   })
 }
@@ -121,8 +123,26 @@ export function useRefreshQuota() {
   })
 }
 
-export async function fetchAccountPat(id: number): Promise<string> {
-  const data = await api<{ pat: string }>(`/api/accounts/${id}/pat`)
+export function useUpdateAccount() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...patch
+    }: { id: number; priority?: number; enabled?: boolean; name?: string; default_model?: string; reserve_credits?: number }) =>
+      api<Account>(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+    onSuccess: () => {
+      // Same four keys the other account mutations invalidate — a priority or
+      // enable/disable change alters both the pool view and routing.
+      qc.invalidateQueries({ queryKey: ['pool-status'] })
+      qc.invalidateQueries({ queryKey: ['dashboard-stats'] })
+      qc.invalidateQueries({ queryKey: ['accounts', 'available'] })
+      qc.invalidateQueries({ queryKey: ['accounts', 'exhausted'] })
+    },
+  })
+}
+
+export async function fetchAccountPat(id: number): Promise<string> {  const data = await api<{ pat: string }>(`/api/accounts/${id}/pat`)
   return data.pat
 }
 

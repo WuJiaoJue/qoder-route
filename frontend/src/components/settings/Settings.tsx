@@ -4,12 +4,18 @@ import { Check, ChevronDown, Network, TerminalSquare, Users } from 'lucide-react
 import { Card, SectionTitle, Switch, Skeleton } from '../ui/GlassPanel'
 import { useSettings, useUpdateSettings } from '../../hooks/useApi'
 import { WORKER_ENABLED } from '../../lib/features'
-import type { AppSettings, QoderInferBase } from '../../types'
+import type { AppSettings, QoderInferBase, RoutingStrategy } from '../../types'
 
 const QODER_ROUTES: { value: QoderInferBase; label: string }[] = [
   { value: 'api1', label: 'api1.qoder.sh' },
   { value: 'api2', label: 'api2.qoder.sh' },
   { value: 'api3', label: 'api3.qoder.sh' },
+]
+
+const ROUTING_STRATEGIES: { value: RoutingStrategy; label: string }[] = [
+  { value: 'fill_first', label: 'Fill first — stick to one account' },
+  { value: 'spread', label: 'Spread — fewest in-flight requests' },
+  { value: 'least_used', label: 'Least used — fewest lifetime requests' },
 ]
 
 type SelectOption<T extends string | number> = { value: T; label: string }
@@ -154,6 +160,32 @@ export function Settings() {
             />
             <span className="block text-[11px] text-neutral-500 mt-2">
               Select the Qoder host used for new inference requests. Changes are applied and saved immediately.
+            </span>
+          </div>
+        )}
+      </Card>
+
+      <Card className="p-5">
+        <SectionTitle icon={<Users size={13} className="text-neutral-400" />}>Account pool</SectionTitle>
+        {isLoading ? (
+          <Skeleton className="h-[70px]" />
+        ) : (
+          <div>
+            <span className="label">Routing strategy</span>
+            <Select
+              value={data?.routing_strategy ?? 'fill_first'}
+              options={ROUTING_STRATEGIES}
+              onChange={(v) => set({ routing_strategy: v })}
+            />
+            <span className="block text-[11px] text-neutral-500 mt-2">
+              How the next request picks an account. <strong className="text-neutral-400">Priority always wins first</strong> —
+              a strategy only reorders accounts of equal priority. Set priority or disable an account from its card in Accounts.
+            </span>
+
+            <span className="block text-[11px] text-neutral-500 mt-2">
+              <strong className="text-neutral-400">Credit reserve is per-account</strong> — set it on each account's card in
+              Accounts. A paid account stops taking paid-model traffic once its remaining credit reaches its own reserve, so the
+              tail of that plan is never drained. Free models and free-tier accounts are never gated.
             </span>
           </div>
         )}

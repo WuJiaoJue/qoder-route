@@ -139,6 +139,25 @@ function prepareInferRequest(ctxPtr, baseUrl, bodyJson, modelKey, modelSource) {
   return r0 >>> 0;
 }
 
+// Generic signed request — the WASM export behind the CLI's `prepareRequest`.
+// Used for read-only catalog/metadata calls that are not inference (e.g. the
+// model list). `body`/`extra` are optional in the ABI, so both are null
+// pointers (0, 0) followed by their ptr/len pair.
+function prepareSignedRequest(ctxPtr, baseUrl, urlPath, method, authType) {
+  const sp = addStack(-16);
+  const a = passString(baseUrl), al = GLOBAL_LEN;
+  const b = passString(urlPath), bl = GLOBAL_LEN;
+  const c = passString(method), cl = GLOBAL_LEN;
+  const d = passString(authType), dl = GLOBAL_LEN;
+  wasm.qodercontext_prepareRequest(sp, ctxPtr, a, al, b, bl, c, cl, d, dl, 0, 0, 0, 0);
+  const r0 = view().getInt32(sp + 0, true);
+  const r1 = view().getInt32(sp + 4, true);
+  const r2 = view().getInt32(sp + 8, true);
+  addStack(16);
+  if (r2) throw takeError(r1);
+  return r0 >>> 0;
+}
+
 function resultUrl(rr) {
   const sp = addStack(-16);
   wasm.requestresult_url(sp, rr);
@@ -255,6 +274,15 @@ const server = http.createServer(async (req, res) => {
       const ctx = getContext(jt, uid, machine_id, cosy_version);
       const rr = prepareInferRequest(ctx, base_url, body_json, model_key, model_source ?? "system");
       const out = { url: resultUrl(rr), headers: resultHeaders(rr), body_b64: resultBody(rr).toString("base64") };
+      wasm.__wbg_requestresult_free(rr, 0);
+      return send(200, out);
+    }
+
+    if (req.url === "/sign_get" && req.method === "POST") {
+      const { jt, uid, machine_id, base_url, url_path, cosy_version } = input;
+      const ctx = getContext(jt, uid, machine_id, cosy_version);
+      const rr = prepareSignedRequest(ctx, base_url, url_path, "GET", "auth");
+      const out = { url: resultUrl(rr), headers: resultHeaders(rr) };
       wasm.__wbg_requestresult_free(rr, 0);
       return send(200, out);
     }

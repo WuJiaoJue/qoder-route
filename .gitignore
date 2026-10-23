@@ -13,6 +13,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .env
+# Local virtualenv (~93 MB, machine-specific) — never part of the source tree.
+.venv/
+venv/
 
 # data & logs
 *.db

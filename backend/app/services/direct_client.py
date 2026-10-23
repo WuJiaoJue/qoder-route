@@ -19,8 +19,8 @@ from app.services.quota_service import (
     parse_model_queue,
     MODEL_QUEUE_ERROR_CODE,
 )
-from app.services import qoder_version, settings_service, signer_service
-from app.services.model_catalog import MODEL_CATALOG
+from app.services import qoder_version, settings_service, signer_service, tls
+from app.services import model_catalog
 
 logger = logging.getLogger("qoderroute.direct")
 
@@ -61,15 +61,26 @@ def _get_upstream() -> httpx.AsyncClient:
             timeout=httpx.Timeout(300, connect=20),
             limits=httpx.Limits(max_keepalive_connections=16, max_connections=32),
             http2=False,
+            # OpenSSL 3.5's default PQ ClientHello is dropped on the path to
+            # *.qoder.sh; see app/services/tls.py.
+            verify=tls.qoder_verify(),
         )
     return _upstream_client
 
-MODEL_KEY_MAP = {
-    **{str(entry["key"]): str(entry["key"]) for entry in MODEL_CATALOG},
-    # Kept for callers that still use the old private preview tier.  It is not
-    # advertised as Qwen3.8-Max and intentionally stays outside the catalog.
-    "qmodel_preview": "qmodel_preview",
-}
+# Built from the *effective* catalog on demand. Freezing these at import time
+# would make a synced catalog invisible to request building — the request would
+# still be shaped for the baseline entry.
+def _model_key_map() -> dict[str, str]:
+    return {
+        **{str(entry["key"]): str(entry["key"]) for entry in model_catalog.effective_catalog()},
+        # Kept for callers that still use the old private preview tier.  It is
+        # not advertised as Qwen3.8-Max and intentionally stays outside the catalog.
+        "qmodel_preview": "qmodel_preview",
+    }
+
+
+# Baseline snapshot kept for compatibility; request building uses _model_key_map().
+MODEL_KEY_MAP = {**{str(e["key"]): str(e["key"]) for e in model_catalog.MODEL_CATALOG}, "qmodel_preview": "qmodel_preview"}
 
 
 # Fast mode is a per-model function switch; in Qoder it's only exposed on
@@ -80,31 +91,39 @@ _FAST_CAPABLE = {"kmodel"}
 # the smaller catalog windows; the named long-context models accept 1M, except
 # Kimi K2.7 Code which has one fixed 256K window.
 _DEFAULT_CONTEXT_WINDOW = 1_000_000
-_CONTEXT_WINDOW_BY_MODEL = {
-    str(entry["key"]): int(
-        max(entry["context_windows"])
-        if entry["context_windows"]
-        else entry["max_input_tokens"]
-    )
-    for entry in MODEL_CATALOG
-}
+def _context_windows_by_model() -> dict[str, int]:
+    return {
+        str(entry["key"]): int(
+            max(entry["context_windows"])
+            if entry["context_windows"]
+            else entry["max_input_tokens"]
+        )
+        for entry in model_catalog.effective_catalog()
+    }
+
+
+_CONTEXT_WINDOW_BY_MODEL = _context_windows_by_model()
 _DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 # Native Qoder normalizes catalog models before placing them in the request.
 # Most legacy tier keys tolerate the compact form, but the final Qwen3.8
 # route needs its real catalog identity instead of the old preview fallback.
-_MODEL_CONFIG_DETAILS: dict[str, dict[str, Any]] = {
-    str(entry["key"]): {
-        "display_name": str(entry["name"]),
-        "model": "",
-        "format": "openai",
-        "is_vl": bool(entry["is_vision"]),
-        "api_key": "",
-        "url": "",
-        "max_input_tokens": int(entry["max_input_tokens"]),
+def _model_config_details() -> dict[str, dict[str, Any]]:
+    return {
+        str(entry["key"]): {
+            "display_name": str(entry["name"]),
+            "model": "",
+            "format": "openai",
+            "is_vl": bool(entry["is_vision"]),
+            "api_key": "",
+            "url": "",
+            "max_input_tokens": int(entry["max_input_tokens"]),
+        }
+        for entry in model_catalog.effective_catalog()
     }
-    for entry in MODEL_CATALOG
-}
+
+
+_MODEL_CONFIG_DETAILS = _model_config_details()
 # Qwen3.8-Max calls its strongest catalog effort ``xhigh``.  Sending the
 # generic ``max`` value used by the other models is outside its advertised
 # enum and can make the inference gateway reject an otherwise valid request.
@@ -123,9 +142,15 @@ _OMIT_EXPLICIT_THINKING_SWITCHES = frozenset({"qmodel_38max", "qfmodel"})
 # Capability from Qoder's model catalog.  Kimi/Auto can emit opportunistic
 # reasoning, but the CLI still declares them as non-reasoning models and uses
 # parameters.enable_thinking as a separate best-effort switch.
-_REASONING_CAPABLE_MODELS = {
-    str(entry["key"]) for entry in MODEL_CATALOG if entry["is_reasoning"]
-} | {"qmodel_preview"}
+def _reasoning_capable_models() -> set[str]:
+    return {
+        str(entry["key"])
+        for entry in model_catalog.effective_catalog()
+        if entry["is_reasoning"]
+    } | {"qmodel_preview"}
+
+
+_REASONING_CAPABLE_MODELS = _reasoning_capable_models()
 
 
 def normalize_session_id(session_id: Optional[str]) -> Optional[str]:
@@ -314,7 +339,7 @@ def _build_body(messages: list[dict], model_key: str, tools: Optional[list[dict]
     resolved_session_id = normalize_session_id(session_id) or str(uuid.uuid4())
     effort = _normalize_effort(reasoning_effort, model_key)
     thinking_enabled = effort != "none"
-    is_reasoning = model_key in _REASONING_CAPABLE_MODELS and thinking_enabled
+    is_reasoning = model_key in _reasoning_capable_models() and thinking_enabled
     system_prompt, normalized_messages, last_user_text = _prepare_messages(messages)
 
     # fast defaults ON for capable models unless caller explicitly disables it
@@ -322,11 +347,11 @@ def _build_body(messages: list[dict], model_key: str, tools: Optional[list[dict]
         fast = model_key in _FAST_CAPABLE
     # context window falls back to the per-model default
     if not context_window or context_window <= 0:
-        context_window = _CONTEXT_WINDOW_BY_MODEL.get(model_key, _DEFAULT_CONTEXT_WINDOW)
+        context_window = _context_windows_by_model().get(model_key, _DEFAULT_CONTEXT_WINDOW)
 
     model_config: dict[str, Any] = {
         "key": model_key,
-        **_MODEL_CONFIG_DETAILS.get(model_key, {}),
+        **_model_config_details().get(model_key, {}),
         "source": "system",
         "is_reasoning": is_reasoning,
     }
@@ -550,7 +575,7 @@ async def run_infer(
     """Direct signed infer request. Yields events:
     {"type":"text"|"thinking"|"reasoning_item"|"reasoning_signature"|
             "tool_calls"|"function_call"|"done"|"error", ...}"""
-    model_key = MODEL_KEY_MAP.get(model_level, "auto")
+    model_key = _model_key_map().get(model_level, "auto")
     effective_machine_id = (machine_id or "").strip()
     if not effective_machine_id:
         yield {"type": "error", "message": "account machine_id is required"}
@@ -659,7 +684,7 @@ async def run_infer(
         "request_context_length": (
             context_window
             if context_window is not None and context_window > 0
-            else _CONTEXT_WINDOW_BY_MODEL.get(model_key, _DEFAULT_CONTEXT_WINDOW)
+            else _context_windows_by_model().get(model_key, _DEFAULT_CONTEXT_WINDOW)
         ),
         "request_max_tokens": (
             max_tokens
@@ -667,7 +692,7 @@ async def run_infer(
             else _DEFAULT_MAX_OUTPUT_TOKENS
         ),
         "request_model_is_reasoning": (
-            model_key in _REASONING_CAPABLE_MODELS and effective_effort != "none"
+            model_key in _reasoning_capable_models() and effective_effort != "none"
         ),
         "request_enable_thinking": effective_effort != "none",
         "request_reasoning_effort": effective_effort,

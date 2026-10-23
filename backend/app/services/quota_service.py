@@ -8,6 +8,8 @@ from typing import Optional
 
 import httpx
 
+from app.services import tls
+
 logger = logging.getLogger("qoderroute.quota")
 
 QODER_BASE = "https://openapi.qoder.sh"
@@ -124,7 +126,7 @@ def _parse_quota(quota: dict) -> dict:
 async def fetch_plan_quota(pat: str) -> Optional[dict]:
     """Fetch plan + quota + userinfo for a PAT. Returns merged dict or None on failure."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, verify=tls.qoder_verify()) as client:
             token = await _get_job_token(client, pat)
             if not token:
                 return None
@@ -241,7 +243,7 @@ def _plan_name_from_quota(plan_tier: str, plan_name: str, quota_total) -> str:
 
 
 async def get_job_token(pat: str) -> Optional[str]:
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, verify=tls.qoder_verify()) as client:
         return await _get_job_token(client, pat)
 
 
@@ -252,7 +254,7 @@ async def get_uid(pat: str) -> Optional[str]:
     if pat in _uid_cache:
         return _uid_cache[pat]
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, verify=tls.qoder_verify()) as client:
             token = await _get_job_token(client, pat)
             if not token:
                 return None
@@ -338,6 +340,36 @@ def looks_like_transient_stream_error(message: str) -> bool:
     """Heuristic: a flaky mid-stream connection drop, safe to retry once."""
     m = (message or "").lower()
     return any(k in m for k in _TRANSIENT_STREAM_MARKERS)
+
+
+# Live free-tier traffic reports isQueued=true with queueCount=0 and
+# serviceAvailable=false (subCode RESOURCE_LIMIT): nothing is ahead of us, the
+# upstream resource itself is short. The server still states how long to wait.
+QUEUE_RETRY_MIN_SECONDS = 1.0
+QUEUE_RETRY_MAX_SECONDS = 30.0
+QUEUE_RETRY_DEFAULT_SECONDS = 5.0
+
+
+def queue_retry_delay(queue: Optional[dict]) -> float:
+    """Delay before re-attempting a 10605, from the server's own hint.
+
+    Prefers ``retryAfterSeconds``, then ``waitTime``. The value is clamped to
+    [1, 30] so a missing, garbled or hostile number can never stall a worker.
+    """
+    raw = None
+    if isinstance(queue, dict):
+        for key in ("retryAfterSeconds", "waitTime"):
+            value = queue.get(key)
+            if value is None:
+                continue
+            try:
+                raw = float(value)
+            except (TypeError, ValueError):
+                continue
+            break
+    if raw is None:
+        raw = QUEUE_RETRY_DEFAULT_SECONDS
+    return max(QUEUE_RETRY_MIN_SECONDS, min(QUEUE_RETRY_MAX_SECONDS, raw))
 
 
 def parse_model_queue(message: str) -> Optional[dict]:

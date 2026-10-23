@@ -14,18 +14,66 @@ from app.services.account_pool import pool
 from app.services import direct_client
 from app.services.request_log import RequestTrace, log_outcome
 from app.services.qoder_client import resolve_model_level
+from app.services.model_catalog import is_free_model
 from app.services.quota_service import (
     looks_like_quota_error,
     looks_like_model_queue,
     looks_like_rate_limit,
     looks_like_transient_stream_error,
     parse_model_queue,
+    queue_retry_delay,
 )
 
 router = APIRouter(tags=["chat"])
 
 MAX_SWAP_ATTEMPTS = 3
-MODEL_QUEUE_RETRY_DELAY = 3.0
+# In-process retries for a 10605 before handing the backpressure to the client.
+MAX_QUEUE_RETRIES = 2
+
+
+def _queue_busy_message(message: str, queue: dict | None) -> str:
+    """Client-facing text for an unresolvable 10605.
+
+    The raw upstream text reads ``upstream status 403: {"code":"10605",...}``.
+    Forwarding it verbatim is actively harmful: clients classify failures by
+    *substring-matching the message*, not only by HTTP status. DSH's
+    ``classifyPiAiError`` tests ``/\\b(?:401|403)\\b/`` **before** its 429 rule,
+    so the literal "403" inside the payload made a retryable capacity error look
+    like ``AUTH`` — the turn aborted with "API 密钥无效" and no retry.
+
+    So the message is rebuilt without the misleading 403 and states the actual
+    condition (transient capacity) plus, when known, the server's own hint.
+    """
+    parts = ["upstream model capacity unavailable (10605)"]
+    if isinstance(queue, dict):
+        if queue.get("modelKey"):
+            parts.append(f"model={queue['modelKey']}")
+        if queue.get("subCode"):
+            parts.append(f"reason={queue['subCode']}")
+        if queue.get("queueCount") is not None:
+            parts.append(f"queued_ahead={queue['queueCount']}")
+    parts.append("this is transient backpressure, not an authentication failure")
+    return "; ".join(parts)
+
+
+def _queue_busy_error(message: str, queue: dict | None) -> HTTPException:
+    """Build the client-facing error for an unresolvable 10605.
+
+    A model queue is transient upstream backpressure, so it must NOT surface as
+    403: the OpenAI SDK maps 403 to PermissionDeniedError, DSH reports that to
+    the agent loop as failure code ``AUTH``, and the turn dies as if the
+    credentials were bad. 429 keeps it retryable and lets the SDK back off.
+
+    ``Retry-After`` carries the server's own wait. The message is sanitised by
+    ``_queue_busy_message`` so a client that classifies on message text cannot
+    mistake it for an auth error (see that function).
+    """
+    delay = queue_retry_delay(queue)
+    return HTTPException(
+        status_code=429,
+        detail=_queue_busy_message(message, queue),
+        headers={"Retry-After": str(int(round(delay)))},
+    )
 
 
 def classify_chat_error(message: str, error_scope: str | None = None) -> str:
@@ -162,11 +210,13 @@ async def chat_completions(
     tried_ids: set[int] = set()
     model_level = _resolve_level(body.model)
     trace = RequestTrace("openai", model_level)
+    free_model = is_free_model(model_level)
 
     for _ in range(MAX_SWAP_ATTEMPTS):
         account = await pool.get_next_account(
             db,
             exclude_ids=tried_ids,
+            free_model=free_model,
         )
         if not account:
             break
@@ -198,6 +248,7 @@ async def chat_completions(
         try:
             if body.stream:
                 gen = start_gen()
+                queue_attempts = 0
                 # Probe the first event before committing the SSE stream so an
                 # upstream error (403, etc.) surfaces with its real status instead
                 # of a 200 OK with [error] text buried in the body.
@@ -216,18 +267,28 @@ async def chat_completions(
                     except StopAsyncIteration:
                         first = {"type": "error", "message": "empty upstream response"}
 
-                # 10605 with an empty queue (isQueued=false): the model may clear
-                # in a moment — wait 3s and retry once before surfacing the error.
+                # 10605 = transient upstream backpressure. Live free-tier traffic
+                # always reports isQueued=true (with queueCount=0 and
+                # serviceAvailable=false), so gating the retry on isQueued=false
+                # made this branch dead for the exact condition users hit. Retry
+                # up to MAX_QUEUE_RETRIES times, honouring the server's own
+                # retryAfterSeconds, then surface 429 rather than 403.
                 if first.get("type") == "error" and classify_chat_error(first.get("message", ""), first.get("error_scope")) == "model_queue":
                     queue = parse_model_queue(first.get("message", ""))
-                    if queue is not None and queue.get("isQueued") is False:
-                        trace.emit("info", "model queue empty (10605, isQueued=false) — retrying in 3s", phase="retry")
-                        await asyncio.sleep(MODEL_QUEUE_RETRY_DELAY)
+                    if queue_attempts < MAX_QUEUE_RETRIES:
+                        queue_attempts += 1
+                        delay = queue_retry_delay(queue)
+                        trace.emit("info", f"model queued (10605) — retrying in {delay:.0f}s (attempt {queue_attempts}/{MAX_QUEUE_RETRIES})", phase="retry")
+                        await asyncio.sleep(delay)
                         gen = start_gen()
                         try:
                             first = await gen.__anext__()
                         except StopAsyncIteration:
                             first = {"type": "error", "message": "empty upstream response"}
+                    if first.get("type") == "error" and classify_chat_error(first.get("message", ""), first.get("error_scope")) == "model_queue":
+                        queue = parse_model_queue(first.get("message", ""))
+                        trace.emit("warn", f"model queued: {first.get('message', '')[:200]}", phase="error", outcome="queue")
+                        raise _queue_busy_error(first.get("message", "model unavailable"), queue)
 
                 if first.get("type") == "error":
                     msg = first.get("message", "upstream error")
@@ -237,8 +298,9 @@ async def chat_completions(
                         raise HTTPException(status_code=first.get("status") or 503, detail=msg)
                     if error_kind == "model_queue":
                         # 10605: model queued upstream — don't fail the account.
+                        # Reached only when the bounded retry above is exhausted.
                         trace.emit("warn", f"model queued: {msg[:200]}", phase="error", outcome="queue")
-                        raise HTTPException(status_code=first.get("status") or 503, detail=msg)
+                        raise _queue_busy_error(msg, parse_model_queue(msg))
                     if error_kind == "quota":
                         trace.emit("warn", "quota exceeded, swapping account", phase="swap", outcome="quota")
                         await pool.mark_quota_exceeded(account_id)
@@ -255,7 +317,7 @@ async def chat_completions(
                     first,
                 )
 
-            queue_retried = False
+            queue_attempts = 0
             transient_retried = False
             while True:
                 final_text = ""
@@ -320,17 +382,20 @@ async def chat_completions(
                     await asyncio.sleep(1)
                     continue
 
-                # 10605 with an empty queue (isQueued=false): the model may clear
-                # in a moment — wait 3s and retry once before surfacing the error.
+                # 10605 = transient upstream backpressure. Retry in-process up to
+                # MAX_QUEUE_RETRIES times, honouring the server's own
+                # retryAfterSeconds, then surface 429 rather than 403 (see
+                # _queue_busy_error for why 403 breaks the client).
                 if error_msg is not None and classify_chat_error(error_msg, error_scope) == "model_queue":
                     queue = parse_model_queue(error_msg)
-                    if queue is not None and queue.get("isQueued") is False and not queue_retried:
-                        queue_retried = True
-                        trace.emit("info", "model queue empty (10605, isQueued=false) — retrying in 3s", phase="retry")
-                        await asyncio.sleep(MODEL_QUEUE_RETRY_DELAY)
+                    if queue_attempts < MAX_QUEUE_RETRIES:
+                        queue_attempts += 1
+                        delay = queue_retry_delay(queue)
+                        trace.emit("info", f"model queued (10605) — retrying in {delay:.0f}s (attempt {queue_attempts}/{MAX_QUEUE_RETRIES})", phase="retry")
+                        await asyncio.sleep(delay)
                         continue
                     trace.emit("warn", f"model queued: {error_msg[:200]}", phase="error", outcome="queue")
-                    raise HTTPException(status_code=error_status or 503, detail=error_msg)
+                    raise _queue_busy_error(error_msg, queue)
                 break
 
             if error_msg is not None:

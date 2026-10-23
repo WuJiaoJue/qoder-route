@@ -4,7 +4,9 @@ export interface Account {
   pat_short: string
   is_active: boolean
   is_available: boolean
+  enabled: boolean
   priority: number
+  reserve_credits: number
   model_level: string
   default_model: string
   last_used_at: string | null
@@ -45,6 +47,7 @@ export interface DashboardStats {
   available_now: number
   accounts_in_cooldown: number
   accounts_exhausted: number
+  accounts_disabled: number
   total_requests: number
   total_tokens: number
   credits_spent: number
@@ -92,6 +95,7 @@ export interface WorkerStatus {
 }
 
 export type QoderInferBase = 'api1' | 'api2' | 'api3'
+export type RoutingStrategy = 'fill_first' | 'spread' | 'least_used'
 
 export interface AppSettings {
   worker_logs_enabled: boolean
@@ -102,6 +106,7 @@ export interface AppSettings {
   accounts_show_requests: boolean
   accounts_auto_delete_exhausted: boolean
   qoder_infer_base: QoderInferBase
+  routing_strategy: RoutingStrategy
 }
 
 export interface ActivityPoint {
@@ -118,8 +123,13 @@ export interface ModelUsage {
   credits: number
 }
 
+/** Traffic window presets accepted by /stats/activity. */
+export type ActivityWindow = '1h' | '6h' | '24h'
+
 export interface ActivityStats {
   bucket_sec: number
+  window_sec?: number
+  window_key?: ActivityWindow
   series: ActivityPoint[]
   by_model: ModelUsage[]
   window: { requests: number; tokens: number; credits: number }

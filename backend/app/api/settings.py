@@ -2,7 +2,7 @@ import logging
 from typing import Literal, Optional
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services import settings_service
 
@@ -19,6 +19,7 @@ class SettingsUpdate(BaseModel):
     accounts_show_requests: Optional[bool] = None
     accounts_auto_delete_exhausted: Optional[bool] = None
     qoder_infer_base: Optional[Literal["api1", "api2", "api3"]] = None
+    routing_strategy: Optional[Literal["fill_first", "spread", "least_used"]] = None
 
 
 @router.get("")

@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.api import accounts, chat, models, logs, settings as settings_api, anthropic
 from app.services.account_pool import pool
-from app.services import settings_service, signer_service, qoder_version, request_store
+from app.services import settings_service, signer_service, qoder_version, request_store, model_sync
 
 # Worker endpoints are optional — the public build ships without them.
 try:
@@ -69,6 +69,15 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(2)
         await pool.refresh_all_quotas()
 
+    # Model catalog: restore the last synced snapshot, then refresh periodically.
+    # Both steps are non-fatal — without them the static baseline stays active.
+    if model_sync.load_synced():
+        logger.info("Model catalog restored from last sync")
+    model_sync_task = asyncio.create_task(
+        model_sync.sync_loop(),
+        name="model-catalog-sync",
+    )
+
     initial_task = asyncio.create_task(_initial_quota())
     refresher = asyncio.create_task(_quota_refresher())
     try:
@@ -78,11 +87,13 @@ async def lifespan(app: FastAPI):
         initial_task.cancel()
         signer_task.cancel()
         version_task.cancel()
+        model_sync_task.cancel()
         await asyncio.gather(
             refresher,
             initial_task,
             signer_task,
             version_task,
+            model_sync_task,
             return_exceptions=True,
         )
         # The signer is a host-level singleton.  It deliberately survives this

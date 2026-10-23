@@ -1,9 +1,9 @@
 import { motion, AnimatePresence } from 'framer-motion'
-import { useState } from 'react'
-import { usePoolStatus, useAddAccount, useDeleteAccount, useRefreshQuota, fetchAccountPat, useSettings, useAvailableAccounts, useExhaustedAccounts } from '../../hooks/useApi'
+import { useState, useEffect } from 'react'
+import { usePoolStatus, useAddAccount, useDeleteAccount, useRefreshQuota, useUpdateAccount, fetchAccountPat, useSettings, useAvailableAccounts, useExhaustedAccounts } from '../../hooks/useApi'
 import { StatusBadge, Card, Modal, Skeleton, EmptyState } from '../ui/GlassPanel'
 import { timeAgo, planEndInfo } from '../../lib/utils'
-import { Plus, Trash2, KeyRound, Activity, ArrowUpRight, RefreshCw, Crown, Copy, Check, Wallet, WalletMinimal, CalendarClock, ScrollText } from 'lucide-react'
+import { Plus, Trash2, KeyRound, Activity, ArrowUpRight, RefreshCw, Crown, Copy, Check, Wallet, WalletMinimal, CalendarClock, ScrollText, Pause, Play } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import type { Account } from '../../types'
 
@@ -16,7 +16,10 @@ const rise = {
   show: { opacity: 1, y: 0, transition: { duration: 0.35, ease: [0.22, 1, 0.36, 1] } },
 }
 
-function getStatus(acc: Account): 'active' | 'error' {
+function getStatus(acc: Account): 'active' | 'error' | 'disabled' {
+  // Operator intent outranks health: a disabled account is inert regardless of
+  // its quota/failure state, so it reads as "Disabled" rather than "Error".
+  if (!acc.enabled) return 'disabled'
   if (acc.is_quota_exceeded) return 'error'
   if (acc.consecutive_failures >= 3) return 'error'
   if (acc.last_error_message) return 'error'
@@ -125,10 +128,13 @@ function CopyPatButton({ accountId }: { accountId: number }) {
   )
 }
 
-function AccountCard({ acc, onDelete, onRefreshQuota, quotaRefreshing, quotaRefreshed, showEmail, showTokens, showRequests }: {
+function AccountCard({ acc, onDelete, onRefreshQuota, onToggleEnabled, onPriorityChange, onReserveChange, quotaRefreshing, quotaRefreshed, showEmail, showTokens, showRequests }: {
   acc: Account
   onDelete: () => void
   onRefreshQuota: () => void
+  onToggleEnabled: () => void
+  onPriorityChange: (priority: number) => void
+  onReserveChange: (reserve: number) => void
   quotaRefreshing: boolean
   quotaRefreshed: boolean
   showEmail: boolean
@@ -136,10 +142,39 @@ function AccountCard({ acc, onDelete, onRefreshQuota, quotaRefreshing, quotaRefr
   showRequests: boolean
 }) {
   const status = getStatus(acc)
+  // Priority is edited inline; keep a local draft so typing doesn't fire a
+  // PATCH per keystroke (the request goes out on blur / Enter).
+  const [priorityDraft, setPriorityDraft] = useState(String(acc.priority))
+  useEffect(() => { setPriorityDraft(String(acc.priority)) }, [acc.priority])
+
+  const commitPriority = () => {
+    const parsed = parseInt(priorityDraft, 10)
+    if (Number.isNaN(parsed) || parsed === acc.priority) {
+      setPriorityDraft(String(acc.priority))
+      return
+    }
+    onPriorityChange(parsed)
+  }
+
+  // Reserve uses the same draft-then-commit pattern as priority.
+  const [reserveDraft, setReserveDraft] = useState(String(acc.reserve_credits ?? 0))
+  useEffect(() => { setReserveDraft(String(acc.reserve_credits ?? 0)) }, [acc.reserve_credits])
+
+  const commitReserve = () => {
+    const parsed = parseInt(reserveDraft, 10)
+    if (Number.isNaN(parsed) || parsed < 0 || parsed > 2000) {
+      setReserveDraft(String(acc.reserve_credits ?? 0))
+      return
+    }
+    if (parsed === (acc.reserve_credits ?? 0)) return
+    onReserveChange(parsed)
+  }
 
   return (
     <motion.div variants={rise} layout>
-      <Card className="p-5 group">
+      {/* Disabled accounts stay visible (so they can be re-enabled) but read as
+          inert: dimmed, with the toggle as the obvious next action. */}
+      <Card className={`p-5 group transition-opacity ${acc.enabled ? '' : 'opacity-55'}`}>
         <div className="flex items-start justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <div
@@ -179,6 +214,13 @@ function AccountCard({ acc, onDelete, onRefreshQuota, quotaRefreshing, quotaRefr
               <ScrollText size={14} />
             </Link>
             <button
+              onClick={onToggleEnabled}
+              className="icon-btn"
+              title={acc.enabled ? 'Disable (remove from rotation)' : 'Enable (return to rotation)'}
+            >
+              {acc.enabled ? <Pause size={14} /> : <Play size={14} className="text-white" />}
+            </button>
+            <button
               onClick={onRefreshQuota}
               disabled={quotaRefreshing}
               className="icon-btn"
@@ -194,6 +236,44 @@ function AccountCard({ acc, onDelete, onRefreshQuota, quotaRefreshing, quotaRefr
               <Trash2 size={14} />
             </button>
           </div>
+        </div>
+
+        {/* Priority: higher wins in rotation. Always visible (not hover-only)
+            because the current value is operationally meaningful. */}
+        <div className="mt-3 flex items-center gap-2 text-[11px] text-neutral-500">
+          <span className="uppercase tracking-wider text-[10px] text-neutral-600">Priority</span>
+          <input
+            type="number"
+            min={-100}
+            max={100}
+            value={priorityDraft}
+            onChange={(e) => setPriorityDraft(e.target.value)}
+            onBlur={commitPriority}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+            className="w-16 rounded-md px-2 py-0.5 text-[11px] tabular-nums text-neutral-200 outline-none focus:ring-1 focus:ring-neutral-500"
+            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
+            title="Higher priority is preferred in rotation (-100..100)"
+          />
+          <span className="text-[10px] text-neutral-600">higher is preferred</span>
+        </div>
+
+        {/* Per-account credit reserve: stop spending this account before it is
+            drained. Paid models only — free models ignore it. */}
+        <div className="mt-2 flex items-center gap-2 text-[11px] text-neutral-500">
+          <span className="uppercase tracking-wider text-[10px] text-neutral-600">Reserve</span>
+          <input
+            type="number"
+            min={0}
+            max={2000}
+            value={reserveDraft}
+            onChange={(e) => setReserveDraft(e.target.value)}
+            onBlur={commitReserve}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+            className="w-16 rounded-md px-2 py-0.5 text-[11px] tabular-nums text-neutral-200 outline-none focus:ring-1 focus:ring-neutral-500"
+            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
+            title="Credits kept in hand on this account (0 = off, max 2000)"
+          />
+          <span className="text-[10px] text-neutral-600">credits kept in hand</span>
         </div>
 
         <div className="mt-4">
@@ -241,6 +321,7 @@ export function AccountManager() {
   const addAccount = useAddAccount()
   const deleteAccount = useDeleteAccount()
   const refreshQuota = useRefreshQuota()
+  const updateAccount = useUpdateAccount()
   
   // Use dedicated endpoints for filtered views
   const { data: availableData, isLoading: loadingAvailable } = useAvailableAccounts()
@@ -254,9 +335,17 @@ export function AccountManager() {
 
   const [activeTab, setActiveTab] = useState<'available' | 'exhausted'>('available')
 
-  // Get current data based on active tab
-  const accountsData = activeTab === 'available' ? availableData : exhaustedData
-  const currentAccounts = accountsData?.accounts ?? []
+  // Get current data based on active tab.
+  //
+  // The Available tab also shows disabled accounts (dimmed, with a Disabled
+  // badge) even though `/available` excludes them from routing: a disabled row
+  // matches neither tab's filter, and hiding it would leave no way to
+  // re-enable it. The tab's count still reflects the routing-accurate number,
+  // so the badge stays honest while the list stays actionable.
+  const disabledAccounts = (pool?.accounts ?? []).filter((a) => !a.enabled)
+  const currentAccounts = activeTab === 'available'
+    ? [...(availableData?.accounts ?? []), ...disabledAccounts]
+    : (exhaustedData?.accounts ?? [])
 
   const handleAdd = async () => {
     try {
@@ -438,6 +527,9 @@ export function AccountManager() {
                 showRequests={appSettings?.accounts_show_requests ?? true}
                 onDelete={() => setPendingDelete(acc)}
                 onRefreshQuota={() => handleRefreshQuota(acc.id)}
+                onToggleEnabled={() => updateAccount.mutate({ id: acc.id, enabled: !acc.enabled })}
+                onPriorityChange={(priority) => updateAccount.mutate({ id: acc.id, priority })}
+                onReserveChange={(reserve_credits) => updateAccount.mutate({ id: acc.id, reserve_credits })}
               />
             ))}
           </AnimatePresence>

@@ -20,7 +20,24 @@ class Account(Base):
     # Always true — per-account disable was removed; kept for pool filters / legacy rows.
     is_active = Column(Boolean, default=True, nullable=False)
     is_available = Column(Boolean, default=True, nullable=False)
+
+    # Operator switch: False takes the account out of rotation until re-enabled.
+    # Distinct from `is_active` (force-reset to 1 at every boot) and from
+    # `is_available` (a derived flag rewritten by six different code paths).
+    # Every `is_available` writer must AND with this, and routing must gate on
+    # it directly. Disabling never clears quota/cooldown state, so re-enabling
+    # restores the account exactly as it was.
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+
     priority = Column(Integer, default=0, nullable=False)
+
+    # Per-account "credits to keep in hand". A PAID model stops using this
+    # account once its remaining quota would fall to this value, so the tail of
+    # the allowance is never drained (0 = no reserve, the default).
+    # Per-account rather than global because plans differ: a 3,000-credit plan
+    # and a free-tier row cannot share one number. Free models and free-tier
+    # accounts are never gated — see AccountPool._below_reserve.
+    reserve_credits = Column(Integer, default=0, nullable=False, server_default="0")
 
     model_level = Column(String(64), default="auto", nullable=False)
     default_model = Column(String(64), default="", nullable=False)

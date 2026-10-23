@@ -27,17 +27,21 @@ from app.services.account_pool import pool
 from app.services import direct_client
 from app.services.request_log import RequestTrace, log_outcome
 from app.services.qoder_client import resolve_model_level
+from app.services.model_catalog import is_free_model
 from app.services.quota_service import (
     looks_like_transient_stream_error,
     parse_model_queue,
+    queue_retry_delay,
 )
 from app.api.chat import (
     classify_chat_error,
     _client_session_id,
     _merge_tool_call_fragments,
     _finalize_tool_calls,
+    _queue_busy_error,
+    _queue_busy_message,
     MAX_SWAP_ATTEMPTS,
-    MODEL_QUEUE_RETRY_DELAY,
+    MAX_QUEUE_RETRIES,
 )
 
 router = APIRouter(tags=["anthropic"])
@@ -72,10 +76,34 @@ class AnthropicRequest(BaseModel):
     metadata: Optional[dict] = None
 
 
-def _anthropic_error(status: int, error_type: str, message: str) -> JSONResponse:
+def _anthropic_error(
+    status: int,
+    error_type: str,
+    message: str,
+    headers: Optional[dict] = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"type": "error", "error": {"type": error_type, "message": message}},
+        headers=headers,
+    )
+
+
+def _anthropic_queue_busy(message: str, queue: dict | None) -> JSONResponse:
+    """429 (not 403) for an unresolvable 10605.
+
+    A model queue is transient upstream backpressure. Reporting it as 403 makes
+    OpenAI/Anthropic SDKs treat the turn as an auth failure and abort, so the
+    client is told to retry instead, with the server's own wait in Retry-After.
+    The message is sanitised via the shared ``_queue_busy_message`` because
+    clients also classify on message text, where a literal "403" reads as AUTH.
+    """
+    delay = queue_retry_delay(queue)
+    return _anthropic_error(
+        429,
+        "overloaded_error",
+        _queue_busy_message(message, queue),
+        headers={"Retry-After": str(int(round(delay)))},
     )
 
 
@@ -368,9 +396,10 @@ async def create_message(
     tried_ids: set[int] = set()
     model_level = _resolve_level(body.model)
     trace = RequestTrace("anthropic", model_level)
+    free_model = is_free_model(model_level)
 
     for _ in range(MAX_SWAP_ATTEMPTS):
-        account = await pool.get_next_account(db, exclude_ids=tried_ids)
+        account = await pool.get_next_account(db, exclude_ids=tried_ids, free_model=free_model)
         if not account:
             break
 
@@ -415,16 +444,25 @@ async def create_message(
                     except StopAsyncIteration:
                         first = {"type": "error", "message": "empty upstream response"}
 
+                # 10605 = transient upstream backpressure; retry up to
+                # MAX_QUEUE_RETRIES times using the server's own retryAfterSeconds
+                # (see chat._queue_busy_error for why 403 must not be surfaced).
+                queue_attempts = 0
                 if first.get("type") == "error" and classify_chat_error(first.get("message", ""), first.get("error_scope")) == "model_queue":
                     queue = parse_model_queue(first.get("message", ""))
-                    if queue is not None and queue.get("isQueued") is False:
-                        trace.emit("info", "model queue empty (10605) — retrying in 3s", phase="retry")
-                        await asyncio.sleep(MODEL_QUEUE_RETRY_DELAY)
+                    while queue_attempts < MAX_QUEUE_RETRIES:
+                        queue_attempts += 1
+                        delay = queue_retry_delay(queue)
+                        trace.emit("info", f"model queued (10605) — retrying in {delay:.0f}s (attempt {queue_attempts}/{MAX_QUEUE_RETRIES})", phase="retry")
+                        await asyncio.sleep(delay)
                         gen = start_gen()
                         try:
                             first = await gen.__anext__()
                         except StopAsyncIteration:
                             first = {"type": "error", "message": "empty upstream response"}
+                        if first.get("type") != "error" or classify_chat_error(first.get("message", ""), first.get("error_scope")) != "model_queue":
+                            break
+                        queue = parse_model_queue(first.get("message", ""))
 
                 if first.get("type") == "error":
                     msg = first.get("message", "upstream error")
@@ -443,7 +481,7 @@ async def create_message(
                 )
 
             # --- non-streaming -------------------------------------------------
-            queue_retried = False
+            queue_attempts = 0
             transient_retried = False
             while True:
                 final_text = ""
@@ -501,13 +539,14 @@ async def create_message(
 
                 if error_msg is not None and classify_chat_error(error_msg, error_scope) == "model_queue":
                     queue = parse_model_queue(error_msg)
-                    if queue is not None and queue.get("isQueued") is False and not queue_retried:
-                        queue_retried = True
-                        trace.emit("info", "model queue empty (10605) — retrying in 3s", phase="retry")
-                        await asyncio.sleep(MODEL_QUEUE_RETRY_DELAY)
+                    if queue_attempts < MAX_QUEUE_RETRIES:
+                        queue_attempts += 1
+                        delay = queue_retry_delay(queue)
+                        trace.emit("info", f"model queued (10605) — retrying in {delay:.0f}s (attempt {queue_attempts}/{MAX_QUEUE_RETRIES})", phase="retry")
+                        await asyncio.sleep(delay)
                         continue
                     trace.emit("warn", f"model queued: {error_msg[:200]}", phase="error", outcome="queue")
-                    return _anthropic_error(error_status or 503, "api_error", error_msg)
+                    return _anthropic_queue_busy(error_msg, queue)
                 break
 
             if error_msg is not None:
@@ -613,7 +652,7 @@ async def _handle_first_error(first: dict, trace: RequestTrace):
         return _anthropic_error(first.get("status") or 503, "api_error", msg)
     if error_kind == "model_queue":
         trace.emit("warn", f"model queued: {msg[:200]}", phase="error", outcome="queue")
-        return _anthropic_error(first.get("status") or 503, "api_error", msg)
+        return _anthropic_queue_busy(msg, parse_model_queue(msg))
     trace.emit("error", f"upstream error: {msg[:200]}", phase="error", outcome="account")
     if trace.account_id is not None:
         await pool.mark_failure(trace.account_id, msg)

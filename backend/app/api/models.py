@@ -39,3 +39,23 @@ async def list_models():
 @router.get("/api/models/catalog")
 async def model_catalog():
     return public_model_catalog()
+
+
+@router.get("/api/models/sync")
+async def model_sync_status():
+    """Last synced-catalog snapshot info (never fails)."""
+    from app.services import model_sync
+
+    return model_sync.sync_status()
+
+
+@router.post("/api/models/sync")
+async def model_sync_now():
+    """Fetch Qoder's live model list and install it as the effective catalog.
+
+    Returns `ok: false` with a reason when the fetch cannot complete; the
+    baseline catalog stays active in that case.
+    """
+    from app.services import model_sync
+
+    return await model_sync.sync_model_catalog()

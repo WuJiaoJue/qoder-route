@@ -42,11 +42,12 @@ export function HeaderBadge({ icon, children, pulse }: { icon?: ReactNode; child
 }
 
 /* ── Status badge (monochrome) ── */
-type Status = 'active' | 'error'
+type Status = 'active' | 'error' | 'disabled'
 
 const STATUS_META: Record<Status, { chip: string; label: string; pulse: boolean; filled: boolean }> = {
   active:   { chip: 'chip-solid',   label: 'Available', pulse: true,  filled: true },
   error:    { chip: 'chip-outline', label: 'Error',     pulse: false, filled: false },
+  disabled: { chip: 'chip-muted',   label: 'Disabled',  pulse: false, filled: false },
 }
 
 export function StatusBadge({ status }: { status: Status }) {
@@ -57,6 +58,11 @@ export function StatusBadge({ status }: { status: Status }) {
         {status === 'error' ? (
           <>
             <path d="M1 1l6 6M7 1L1 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </>
+        ) : status === 'disabled' ? (
+          <>
+            <circle cx="4" cy="4" r="3" fill="none" stroke="currentColor" strokeWidth="1.2" />
+            <path d="M1.6 6.4l4.8-4.8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
           </>
         ) : (
           <circle cx="4" cy="4" r="3" fill={meta.filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.2" />
