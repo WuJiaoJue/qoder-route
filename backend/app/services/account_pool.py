@@ -249,11 +249,12 @@ class AccountPool:
         widens the credit gate: paid accounts with 0 credits remain routable
         for it. Exhausted free-tier accounts are still excluded.
 
-        ``conversation_key`` enables account stickiness: when a previous turn of
-        the same conversation ran on a still-routable account, that account is
-        preferred so upstream prefix caching stays warm. It is a preference, not
-        a lock — an expired pin, an excluded id (a request just failed there) or
-        an unroutable account falls through to the strategy below and re-pins.
+        ``conversation_key`` enables account stickiness. With
+        ``conversation_affinity`` on, the account that last served this
+        conversation is preferred; with the ``by_conversation`` strategy the
+        starting account is a deterministic shard of the key. Both are
+        preferences, not locks — an expired pin, an excluded id (a request just
+        failed there) or an unroutable account falls through and re-pins.
 
         The returned account is already leased (``_in_flight`` incremented).
         The caller must ``end_request`` or hand the lease to the SSE generator.

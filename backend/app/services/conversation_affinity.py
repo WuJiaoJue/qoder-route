@@ -2,12 +2,17 @@
 
 Why this exists
 ---------------
-Upstream prefix caching is keyed on prompt content, *not* on the ``session_id``
-we forward (measured: a stable and a rotating session id both report the same
-``cached_tokens``). But the cache lives in the account's upstream shard, so a
-multi-turn conversation that bounces between pooled accounts pays a cold cache
-on every hop. Pinning successive turns to one account is what actually keeps
-the cache warm.
+Keeping successive turns of one conversation on the same pooled account. The
+original justification — that upstream prefix caching lives in a per-account
+shard — was **measured and rejected**: stable and rotating session ids both
+report ``cached_tokens=1024``, and turns scattered across three accounts still
+hit 1024 each, so the cache is not account-sharded. See
+``docs/conversation-sharding.md`` for the data.
+
+What survives is a pool-behaviour argument rather than an upstream one: a pin
+records the account that actually served a conversation, so the conversation
+keeps its placement even when the strategy would otherwise move it. The
+companion ``by_conversation`` strategy covers the concurrency case.
 
 Design notes borrowed from zhangdailin/API-Console's ``request_affinity.go``:
 
