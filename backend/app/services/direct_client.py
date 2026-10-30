@@ -205,21 +205,36 @@ def _resolve_infer_base() -> str:
     return DEFAULT_INFER_BASE
 
 
-def _normalize_effort(effort: Optional[str], model_key: str) -> str:
-    """Honor an explicit client effort; otherwise use the model peak.
+def _catalog_default_effort(model_key: str) -> Optional[str]:
+    """The catalog's own default thinking level for a route, when it ships one.
 
-    Missing / blank / unknown values default to ``max`` (or ``xhigh`` for
-    Qwen3.8 Max/Flash).  A bare client ``max`` on those Qwen routes is
-    rewritten to ``xhigh`` because that provider rejects ``max``.
+    Read through the accessor rather than a module-level snapshot so a synced
+    catalog takes effect without a restart.
     """
-    max_effort = _MAX_REASONING_EFFORT_BY_MODEL.get(model_key, "max")
+    meta = model_catalog.effective_thinking_config().get(model_key) or {}
+    default = meta.get("default_effort")
+    return str(default) if default else None
+
+
+def _normalize_effort(effort: Optional[str], model_key: str) -> str:
+    """Honor an explicit client effort; otherwise use the model's own default.
+
+    Missing / blank / unknown values take the catalog's ``default_effort`` on
+    the Qwen3.8 routes (``medium``) and the model peak elsewhere.  A bare
+    client ``max`` on those Qwen routes is rewritten to ``xhigh`` because that
+    provider rejects ``max``.
+    """
+    peak_effort = _MAX_REASONING_EFFORT_BY_MODEL.get(model_key, "max")
+    fallback = peak_effort
+    if model_key in _MAX_REASONING_EFFORT_BY_MODEL:
+        fallback = _catalog_default_effort(model_key) or peak_effort
     if not isinstance(effort, str) or not effort.strip():
-        return max_effort
+        return fallback
     normalized = effort.strip().lower()
     if normalized not in _VALID_REASONING_EFFORTS:
-        return max_effort
+        return fallback
     if model_key in _MAX_REASONING_EFFORT_BY_MODEL and normalized == "max":
-        return max_effort
+        return peak_effort
     return normalized
 
 
@@ -372,15 +387,17 @@ def _build_body(messages: list[dict], model_key: str, tools: Optional[list[dict]
         # grows into the reserved reasoning space, upstream then omits thinking.
         "context_length": context_window,
     }
-    # Qwen3.8 enables thinking through its catalog default.  Its provider
-    # rejects the generic explicit thinking switches when we invent a
-    # default, so omit both fields unless the client sent an effort.
+    # Qwen3.8 enables thinking through its catalog default, so an invented
+    # effort omits enable_thinking.  It must still carry reasoning_effort:
+    # with neither field upstream keeps thinking on and the visible output
+    # allowance collapses, ending finish_reason=length after a few dozen
+    # tokens (qfmodel stopped at 58).
     omit_thinking_switches = (
         model_key in _OMIT_EXPLICIT_THINKING_SWITCHES
         and not _client_sent_effort(reasoning_effort)
     )
+    parameters["reasoning_effort"] = effort
     if not omit_thinking_switches:
-        parameters["reasoning_effort"] = effort
         if thinking_enabled:
             # The native CLI derives the budget from reasoning_effort.  Sending
             # a separate 65K budget reserves excess output space and can squeeze
