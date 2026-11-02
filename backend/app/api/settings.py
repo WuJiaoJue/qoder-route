@@ -21,6 +21,7 @@ class SettingsUpdate(BaseModel):
     qoder_infer_base: Optional[Literal["api1", "api2", "api3"]] = None
     routing_strategy: Optional[Literal["fill_first", "spread", "least_used", "by_conversation"]] = None
     conversation_affinity: Optional[bool] = None
+    request_retention_days: Optional[int] = Field(None, ge=0, le=3650)
 
 
 @router.get("")

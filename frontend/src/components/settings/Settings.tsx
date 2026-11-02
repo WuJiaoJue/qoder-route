@@ -136,6 +136,24 @@ export function Settings() {
 
   const set = (patch: Partial<AppSettings>) => update.mutate(patch)
 
+  // Retention is edited as text and committed on blur/Enter so a half-typed
+  // number is never sent — an empty box must not silently become 0 (= forever).
+  const [retentionDraft, setRetentionDraft] = useState('30')
+  const serverRetention = data?.request_retention_days
+  useEffect(() => {
+    if (serverRetention !== undefined) setRetentionDraft(String(serverRetention))
+  }, [serverRetention])
+
+  const commitRetention = () => {
+    const parsed = parseInt(retentionDraft, 10)
+    if (Number.isNaN(parsed) || parsed < 0 || parsed > 3650) {
+      setRetentionDraft(String(serverRetention ?? 30))
+      return
+    }
+    if (parsed === serverRetention) return
+    set({ request_retention_days: parsed })
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 14 }}
@@ -192,10 +210,35 @@ export function Settings() {
             <div className="mt-5 pt-5" style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}>
               <SettingRow
                 title="Conversation affinity"
-                hint="Keep successive turns of one conversation on the same account, so upstream prefix caching stays warm. A preference only: an unavailable or failing account still falls through to the strategy above."
+                hint="Remember the account that served a conversation and prefer it next turn. A preference only: an unavailable or failing account still falls through to the strategy above. (Not for cache warmth — the upstream cache is not account-sharded.)"
                 checked={data?.conversation_affinity ?? true}
                 onChange={(v) => set({ conversation_affinity: v })}
               />
+
+              <div className="mt-4 flex items-start gap-3">
+                <div className="min-w-0">
+                  <span className="block text-[13px] font-medium text-neutral-200">Request history</span>
+                  <span className="block text-[11px] text-neutral-500 mt-0.5 max-w-[520px]">
+                    Days of per-request history to keep. This is what limits the Dashboard traffic chart — a window longer than
+                    this shows less data. <strong className="text-neutral-400">0 keeps everything</strong> (~120 bytes per request,
+                    roughly 6 MB per week of heavy use).
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <input
+                    type="number"
+                    min={0}
+                    max={3650}
+                    value={retentionDraft}
+                    onChange={(e) => setRetentionDraft(e.target.value)}
+                    onBlur={commitRetention}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                    className="w-20 rounded-md px-2.5 py-1.5 text-[13px] tabular-nums text-neutral-200 outline-none focus:ring-1 focus:ring-neutral-500"
+                    style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}
+                  />
+                  <span className="text-[11px] text-neutral-500">days</span>
+                </div>
+              </div>
             </div>
           </div>
         )}

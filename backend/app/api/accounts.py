@@ -44,40 +44,80 @@ def _is_completion(e: dict) -> bool:
 
 
 # Traffic window presets: label -> (seconds, bucket size). Buckets grow with the
-# window so the series stays ~60-96 points at every scale.
+# window so the series stays ~60-170 points at every scale.
+# `all` is special: its span is whatever the table actually holds, so the bucket
+# is derived at request time (see _bucket_for_span). Its preset entry only needs
+# to exist so the name validates.
 _ACTIVITY_WINDOWS: dict[str, tuple[int, int]] = {
     "1h": (3600, 60),
     "6h": (6 * 3600, 5 * 60),
     "24h": (24 * 3600, 15 * 60),
+    "30d": (30 * 86400, 6 * 3600),
+    "all": (0, 0),
 }
+
+# Candidate bucket widths for the `all` window, ascending.
+_BUCKET_LADDER = (60, 300, 900, 3600, 6 * 3600, 86400, 7 * 86400)
+_MAX_POINTS = 200
+
+
+def _bucket_for_span(span_sec: float) -> int:
+    """Smallest ladder bucket that keeps the series within _MAX_POINTS."""
+    for step in _BUCKET_LADDER:
+        if span_sec / step <= _MAX_POINTS:
+            return step
+    return _BUCKET_LADDER[-1]
 
 
 @router.get("/stats/activity")
 async def dashboard_activity(window: str = "1h"):
     """Chat traffic over a window, aggregated from the persisted request table.
 
-    Reads `request_summaries` (24h retention) rather than the in-memory log bus:
-    the ring buffer holds only 5 000 lines and the hydrated request index only
-    2 000 rows, so a 6h or 24h window would silently under-report. Aggregating in
-    SQL is both exact and restart-proof — the chart no longer blanks on reload.
+    Reads `request_summaries` rather than the in-memory log bus: the ring buffer
+    holds only 5 000 lines and the hydrated request index only 2 000 rows, so a
+    6h, 24h or 30d window would silently under-report. Aggregating in SQL is both
+    exact and restart-proof — the chart no longer blanks on reload.
+
+    The longest window is bounded by retention, not by these presets: see the
+    `request_retention_days` setting. `all` spans whatever the table holds.
 
     Counts completions (`phase=done` + `outcome=ok`), matching the Requests view.
     Tokens are completion tokens, matching the lifetime counters on accounts.
     """
-    spec = _ACTIVITY_WINDOWS.get(window)
-    if spec is None:
+    if window not in _ACTIVITY_WINDOWS:
         raise HTTPException(
             status_code=422,
             detail=f"unknown window '{window}'; expected one of {sorted(_ACTIVITY_WINDOWS)}",
         )
-    window_sec, bucket_sec = spec
 
     now = time.time()
-    n_buckets = window_sec // bucket_sec
-    # Align buckets to whole wall-clock units. A floating `now`-anchored window
-    # moves bucket edges on every poll, so the chart morphs even with no traffic.
-    end = int(now // bucket_sec) * bucket_sec
-    start = end - window_sec
+
+    if window == "all":
+        # Span the actual retained data instead of a fixed length, and derive the
+        # bucket so the series stays a sane size however long the history is.
+        async with async_session() as session:
+            oldest = (await session.execute(
+                select(func.min(RequestSummary.ts))
+            )).scalar()
+        if not oldest:
+            return {
+                "window_key": window, "window_sec": 0, "bucket_sec": 3600,
+                "series": [], "by_model": [],
+                "window": {"requests": 0, "tokens": 0, "credits": 0.0},
+            }
+        bucket_sec = _bucket_for_span(max(now - float(oldest), 3600))
+        end = int(now // bucket_sec) * bucket_sec
+        start = int(float(oldest) // bucket_sec) * bucket_sec
+        window_sec = end - start
+    else:
+        window_sec, bucket_sec = _ACTIVITY_WINDOWS[window]
+        # Align buckets to whole wall-clock units. A floating `now`-anchored
+        # window moves bucket edges on every poll, so the chart morphs even with
+        # no traffic.
+        end = int(now // bucket_sec) * bucket_sec
+        start = end - window_sec
+
+    n_buckets = max(window_sec // bucket_sec, 1)
 
     series = [
         {"t": start + i * bucket_sec, "requests": 0, "tokens": 0, "credits": 0.0}

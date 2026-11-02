@@ -108,6 +108,7 @@ export interface AppSettings {
   qoder_infer_base: QoderInferBase
   routing_strategy: RoutingStrategy
   conversation_affinity: boolean
+  request_retention_days: number
 }
 
 export interface ActivityPoint {
@@ -125,7 +126,7 @@ export interface ModelUsage {
 }
 
 /** Traffic window presets accepted by /stats/activity. */
-export type ActivityWindow = '1h' | '6h' | '24h'
+export type ActivityWindow = '1h' | '6h' | '24h' | '30d' | 'all'
 
 export interface ActivityStats {
   bucket_sec: number

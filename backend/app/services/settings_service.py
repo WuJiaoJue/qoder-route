@@ -41,10 +41,21 @@ _DEFAULTS: dict[str, SettingValue] = {
     "accounts_auto_delete_exhausted": False,
     "qoder_infer_base": "api3",
     "routing_strategy": "fill_first",
-    # Keep successive turns of one conversation on the same pooled account so
-    # upstream prefix caching stays warm. A preference only: an expired pin or
-    # an unroutable account falls through to the normal strategy.
+    # Keep successive turns of one conversation on the same pooled account.
+    # A preference only: an expired pin or an unroutable account falls through
+    # to the normal strategy. (Not for cache warmth — measured, the upstream
+    # cache is not account-sharded; see docs/conversation-sharding.md.)
     "conversation_affinity": True,
+    # How long terminal request summaries stay in SQLite. This is what bounds
+    # the traffic chart: a window longer than the retention just shows less
+    # data. 0 = keep forever (unbounded growth, ~120 bytes per row).
+    "request_retention_days": 30,
+}
+
+# Bounds for integer settings. `request_retention_days` allows 0 (unlimited) and
+# caps at a decade, so a mistyped 999999 cannot silently ask for absurd data.
+_INT_BOUNDS: dict[str, tuple[int, int]] = {
+    "request_retention_days": (0, 3650),
 }
 
 _cache: dict[str, SettingValue] = {
@@ -77,6 +88,9 @@ def _normalize_value(key: str, value: object) -> Optional[SettingValue]:
             except ValueError:
                 return None
         else:
+            return None
+        bounds = _INT_BOUNDS.get(key)
+        if bounds and not (bounds[0] <= parsed <= bounds[1]):
             return None
         return parsed
     if key == "qoder_infer_base" and isinstance(value, str):

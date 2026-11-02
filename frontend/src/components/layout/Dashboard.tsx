@@ -15,6 +15,8 @@ const WINDOWS: { key: ActivityWindow; label: string; card: string }[] = [
   { key: '1h', label: '60 min', card: 'Last hour' },
   { key: '6h', label: '6 hours', card: 'Last 6 hours' },
   { key: '24h', label: '24 hours', card: 'Last 24 hours' },
+  { key: '30d', label: '30 days', card: 'Last 30 days' },
+  { key: 'all', label: 'All', card: 'All retained' },
 ]
 
 const stagger = {

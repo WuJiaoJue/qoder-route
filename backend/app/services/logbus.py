@@ -9,7 +9,7 @@ _subscribers: set[asyncio.Queue] = set()
 
 # Latest snapshot per request_id (live + hydrated from SQLite).
 _requests: OrderedDict[str, dict] = OrderedDict()
-_REQUESTS_MAX = 2000
+REQUESTS_INDEX_MAX = 2000
 
 # Keep sequence numbers increasing across backend generations so EventSource
 # clients can safely deduplicate after an automatic reconnect.
@@ -62,7 +62,7 @@ def _upsert_request(evt: dict) -> None:
     if rid in _requests:
         del _requests[rid]
     _requests[rid] = row
-    while len(_requests) > _REQUESTS_MAX:
+    while len(_requests) > REQUESTS_INDEX_MAX:
         _requests.popitem(last=False)
 
 
