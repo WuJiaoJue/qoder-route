@@ -28,8 +28,30 @@ const rise = {
   show: { opacity: 1, y: 0, transition: { duration: 0.32, ease: [0.22, 1, 0.36, 1] } },
 }
 
-const fmtTime = (t: number) =>
-  new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+/* A single time-of-day formatter is only meaningful inside one day. Over a
+   multi-day window every tick renders the same "02:00 PM", which reads as a
+   broken axis rather than a long range — so the label adapts to the bucket
+   width the backend chose. */
+/* Tooltip labels one hovered point, so unlike the axis it can always show the
+   full stamp regardless of window width. */
+const fmtTooltipTime = (t: number) => {
+  const d = new Date(t * 1000)
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} · ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+}
+
+const makeTimeFormatter = (spanSec: number) => (t: number) => {
+  const d = new Date(t * 1000)
+  // Decide on the total span, not the bucket width. Buckets are aligned to the
+  // Unix epoch, so with a non-hour-aligned timezone offset they never land on
+  // local midnight — testing `getHours() === 0` to switch to a date label would
+  // simply never fire (in UTC+8, 6h buckets sit on 02/08/14/20). And because
+  // recharts picks ticks a whole number of days apart, every label ends up the
+  // same time of day. Past two days, show the date.
+  if (spanSec > 2 * 86400) {
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  }
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
 
 function TrafficTooltip({ active, payload, label }: {
   active?: boolean
@@ -48,7 +70,7 @@ function TrafficTooltip({ active, payload, label }: {
         boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
       }}
     >
-      <div className="text-[10px] text-neutral-600 uppercase tracking-wider mb-1.5">{fmtTime(label)}</div>
+      <div className="text-[10px] text-neutral-600 uppercase tracking-wider mb-1.5">{fmtTooltipTime(label)}</div>
       <div className="space-y-1">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-[2px] shrink-0 bg-neutral-200" />
@@ -67,6 +89,8 @@ function TrafficTooltip({ active, payload, label }: {
 
 function TrafficChart({ series }: { series: { t: number; requests: number; tokens: number }[] }) {
   const empty = !series.some((p) => p.requests > 0 || p.tokens > 0)
+  const spanSec = series.length > 1 ? (series[series.length - 1].t - series[0].t) : 0
+  const fmtTime = makeTimeFormatter(spanSec)
   return (
     <div className="relative h-[220px]">
       <ResponsiveContainer width="100%" height="100%">
@@ -95,12 +119,13 @@ function TrafficChart({ series }: { series: { t: number; requests: number; token
           <YAxis
             yAxisId="req"
             orientation="left"
+            tickFormatter={(v: number) => formatNumber(v)}
             allowDecimals={false}
             domain={[0, (dataMax: number) => Math.max(Math.ceil(dataMax * 1.2), 2)]}
             tick={{ fill: '#525252', fontSize: 10 }}
             axisLine={false}
             tickLine={false}
-            width={28}
+            width={42}
           />
           <YAxis
             yAxisId="tok"
