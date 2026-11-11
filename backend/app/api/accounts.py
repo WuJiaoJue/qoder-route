@@ -13,6 +13,7 @@ from app.models.schemas import (
 )
 from app.models.account import Account
 from app.services.account_pool import pool
+from app.services import campaign_service
 from app.services.qoder_client import validate_pat, qoder_model_display
 from app.services import logbus
 from app.services import quota_service
@@ -430,3 +431,21 @@ async def reveal_account_pat(account_id: int, db: AsyncSession = Depends(get_db)
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"pat": acc.pat_token}
+
+
+@router.get("/campaigns")
+async def list_campaigns():
+    """Daily check-in campaign probe state per account.
+
+    Read-only view of what the background probe last saw. Empty campaign lists
+    are the normal quiet case, not an error — see campaign_service for why a
+    stale desktop Cosy version is indistinguishable from "nothing offered".
+    """
+    return campaign_service.snapshot()
+
+
+@router.post("/campaigns/probe")
+async def run_campaign_probe():
+    """Force a fresh probe now, ignoring the daily pacing."""
+    campaign_service.force_expire()
+    return await campaign_service.probe_all()

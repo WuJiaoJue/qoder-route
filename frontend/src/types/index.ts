@@ -109,6 +109,8 @@ export interface AppSettings {
   routing_strategy: RoutingStrategy
   conversation_affinity: boolean
   request_retention_days: number
+  campaign_cosy_version: string
+  campaign_probe_enabled: boolean
 }
 
 export interface ActivityPoint {

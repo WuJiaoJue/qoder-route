@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.api import accounts, chat, models, logs, settings as settings_api, anthropic
 from app.services.account_pool import pool
-from app.services import settings_service, signer_service, qoder_version, request_store, model_sync
+from app.services import settings_service, signer_service, qoder_version, request_store, model_sync, campaign_service
 
 # Worker endpoints are optional — the public build ships without them.
 try:
@@ -36,6 +36,9 @@ async def _quota_refresher():
             count = await pool.refresh_all_quotas()
             if count:
                 logger.info(f"Quota refresh: {count} accounts updated")
+            # Campaign (check-in) probe rides the same loop but paces itself at
+            # one request per account per day, so this costs nothing most ticks.
+            await campaign_service.probe_all()
         except asyncio.CancelledError:
             raise
         except Exception as e:

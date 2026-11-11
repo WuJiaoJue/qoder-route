@@ -50,6 +50,13 @@ _DEFAULTS: dict[str, SettingValue] = {
     # the traffic chart: a window longer than the retention just shows less
     # data. 0 = keep forever (unbounded growth, ~120 bytes per row).
     "request_retention_days": 30,
+    # Desktop Cosy version the campaigns (check-in) endpoint expects. This is a
+    # different product line from the CLI version tracked by qoder_version.py,
+    # so it cannot be derived — but it must stay adjustable, because a stale
+    # value makes the campaign list come back empty and that is indistinguishable
+    # from "nothing is offered today".
+    "campaign_cosy_version": "0.4.8",
+    "campaign_probe_enabled": True,
 }
 
 # Bounds for integer settings. `request_retention_days` allows 0 (unlimited) and
