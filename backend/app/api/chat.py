@@ -280,6 +280,16 @@ async def chat_completions(
                 # retryAfterSeconds, then surface 429 rather than 403.
                 if first.get("type") == "error" and classify_chat_error(first.get("message", ""), first.get("error_scope")) == "model_queue":
                     queue = parse_model_queue(first.get("message", ""))
+                    # Try another PAT before sleeping on this one. A 10605 with
+                    # serviceAvailable=false means this account cannot serve the
+                    # model right now — another account in the pool often can, and
+                    # a swap costs one request where the in-place retry costs
+                    # 30-60s and usually fails again. The last candidate falls
+                    # through to the retry below so a genuine pool-wide capacity
+                    # dip still gets its backoff before surfacing 429.
+                    if len(tried_ids) < MAX_SWAP_ATTEMPTS:
+                        trace.emit("warn", "model queued (10605) — swapping account", phase="swap", outcome="queue")
+                        continue
                     if queue_attempts < MAX_QUEUE_RETRIES:
                         queue_attempts += 1
                         delay = queue_retry_delay(queue)
@@ -324,6 +334,7 @@ async def chat_completions(
 
             queue_attempts = 0
             transient_retried = False
+            queue_swap = False
             while True:
                 final_text = ""
                 final_thinking = ""
@@ -393,6 +404,13 @@ async def chat_completions(
                 # _queue_busy_error for why 403 breaks the client).
                 if error_msg is not None and classify_chat_error(error_msg, error_scope) == "model_queue":
                     queue = parse_model_queue(error_msg)
+                    # Same reasoning as the streaming branch: swap to another PAT
+                    # rather than burning 30-60s on an account that just said it
+                    # cannot serve the model. Only the last candidate retries.
+                    if len(tried_ids) < MAX_SWAP_ATTEMPTS:
+                        trace.emit("warn", "model queued (10605) — swapping account", phase="swap", outcome="queue")
+                        queue_swap = True
+                        break
                     if queue_attempts < MAX_QUEUE_RETRIES:
                         queue_attempts += 1
                         delay = queue_retry_delay(queue)
@@ -402,6 +420,11 @@ async def chat_completions(
                     trace.emit("warn", f"model queued: {error_msg[:200]}", phase="error", outcome="queue")
                     raise _queue_busy_error(error_msg, queue)
                 break
+
+            if queue_swap:
+                # 10605 on this account: release it and let the outer loop pick
+                # another PAT. The lease is returned by the finally block below.
+                continue
 
             if error_msg is not None:
                 error_kind = classify_chat_error(error_msg, error_scope)

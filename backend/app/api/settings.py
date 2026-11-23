@@ -24,6 +24,7 @@ class SettingsUpdate(BaseModel):
     request_retention_days: Optional[int] = Field(None, ge=0, le=3650)
     campaign_cosy_version: Optional[str] = Field(None, min_length=3, max_length=32)
     campaign_probe_enabled: Optional[bool] = None
+    normalize_agent_fingerprint: Optional[bool] = None
 
 
 @router.get("")

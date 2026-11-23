@@ -57,6 +57,10 @@ _DEFAULTS: dict[str, SettingValue] = {
     # from "nothing is offered today".
     "campaign_cosy_version": "0.4.8",
     "campaign_probe_enabled": True,
+    # Upstream rejects DSH's literal agent fingerprint (see
+    # direct_client._neutralize_agent_fingerprint). Off switches the workaround
+    # back to byte-exact passthrough, for when upstream stops matching on it.
+    "normalize_agent_fingerprint": True,
 }
 
 # Bounds for integer settings. `request_retention_days` allows 0 (unlimited) and
